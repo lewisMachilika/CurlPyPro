@@ -1,0 +1,12 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local app data (Posty stores history/envs in ~/.posty_pro)
+*.log
