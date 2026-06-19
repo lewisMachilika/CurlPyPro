@@ -1,0 +1,4 @@
+# Build/packaging dependencies (not needed to just run the app)
+# Install with:  pip install -r requirements-dev.txt
+-r requirements.txt
+pyinstaller>=6.6,<7

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-posty_pro_with_snippets.py - Posty Pro with code-snippet generation (curl, python requests, powershell, axios)
+curlpro.py - CurlPro with code-snippet generation (curl, python requests, powershell, axios)
 and support for attaching images/files in multipart/form-data.
 
 Requirements:
     pip install PyQt6 requests
 Run:
-    python posty_pro_with_snippets.py
+    python curlpro.py
 """
 import sys
 import os
@@ -34,9 +34,9 @@ from PyQt6.QtGui import QClipboard, QColor, QShortcut, QKeySequence, QFont
 # ---------------------------
 # Storage (SQLite, single file in the data dir)
 # ---------------------------
-DATA_DIR = Path.home() / ".posty_pro"
+DATA_DIR = Path.home() / ".curlpro"
 DATA_DIR.mkdir(exist_ok=True)
-DB_FILE = DATA_DIR / "posty_pro.db"
+DB_FILE = DATA_DIR / "curlpro.db"
 
 def _connect():
     return sqlite3.connect(str(DB_FILE))
@@ -586,10 +586,10 @@ class SnippetDialog(QDialog):
 # ---------------------------
 # Main window
 # ---------------------------
-class PostyMainWindow(QMainWindow):
+class CurlProMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Posty Pro - With Snippet Generator")
+        self.setWindowTitle("CurlPro - With Snippet Generator")
         self.resize(1400, 900)
 
         init_db()
@@ -2421,7 +2421,10 @@ class PostyMainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    win = PostyMainWindow()
+    app.setApplicationName("CurlPro")
+    app.setApplicationDisplayName("CurlPro")
+    app.setOrganizationName("CurlPro")
+    win = CurlProMainWindow()
     win.show()
     sys.exit(app.exec())
 

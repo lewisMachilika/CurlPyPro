@@ -1,4 +1,4 @@
-# Posty Pro runtime dependencies
+# CurlPro runtime dependencies
 # Install with:  pip install -r requirements.txt
 PyQt6>=6.6,<7
 requests>=2.32,<3
