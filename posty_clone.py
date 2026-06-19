@@ -653,6 +653,20 @@ class PostyMainWindow(QMainWindow):
         collections_toolbar.addWidget(btn_new_collection)
         collections_toolbar.addWidget(btn_import_collection)
         collections_toolbar.addWidget(btn_export_collection)
+        collections_toolbar.addStretch()
+
+        btn_coll_expand = QToolButton()
+        btn_coll_expand.setText("⊞")
+        btn_coll_expand.setToolTip("Expand all collections")
+        btn_coll_expand.clicked.connect(lambda: self.collections_tree.expandAll())
+        collections_toolbar.addWidget(btn_coll_expand)
+
+        btn_coll_collapse = QToolButton()
+        btn_coll_collapse.setText("⊟")
+        btn_coll_collapse.setToolTip("Collapse all collections")
+        btn_coll_collapse.clicked.connect(lambda: self.collections_tree.collapseAll())
+        collections_toolbar.addWidget(btn_coll_collapse)
+
         collections_layout.addLayout(collections_toolbar)
 
         self.collections_tree = QTreeWidget()
@@ -1380,6 +1394,39 @@ class PostyMainWindow(QMainWindow):
         except Exception:
             pass
 
+    def clear_attachments(self):
+        """Drop all attached files from both the model and the visible list."""
+        self.file_attachments = []
+        if hasattr(self, "attachments_list"):
+            self.attachments_list.clear()
+
+    def restore_attachments(self, attachments):
+        """Replace the current attachments with a saved list of metadata dicts.
+
+        Each item is {field, path, filename, mime}. Missing files are kept so the
+        user can see what was attached; a marker is shown if the path is gone.
+        """
+        self.clear_attachments()
+        for att in attachments or []:
+            if not isinstance(att, dict):
+                continue
+            field = att.get("field") or "file"
+            path = att.get("path") or ""
+            filename = att.get("filename") or (os.path.basename(path) if path else "")
+            mime = att.get("mime") or "application/octet-stream"
+            missing = "" if (path and os.path.exists(path)) else "  [missing]"
+            self.file_attachments.append({
+                "field": field,
+                "path": path,
+                "filename": filename,
+                "mime": mime,
+            })
+            self.attachments_list.addItem(f"{field}  →  {path}  ({mime}){missing}")
+
+    def _attachments_snapshot(self):
+        """Return a serializable copy of the current attachments."""
+        return [dict(att) for att in self.file_attachments]
+
     # ---------- Events ----------
     def on_body_type_changed(self, text):
         if text == "JSON":
@@ -1546,6 +1593,7 @@ class PostyMainWindow(QMainWindow):
                 "req_headers_text": self.headers_text.toPlainText(),
                 "body_type": self.body_type_combo.currentText(),
                 "auth": self.get_auth_config(),
+                "attachments": self._attachments_snapshot(),
             }
             entry["_id"] = add_history(entry)
             self.history.append(entry)
@@ -1590,6 +1638,7 @@ class PostyMainWindow(QMainWindow):
                 "req_headers_text": self.headers_text.toPlainText(),
                 "body_type": self.body_type_combo.currentText(),
                 "auth": self.get_auth_config(),
+                "attachments": self._attachments_snapshot(),
             }
             entry["_id"] = add_history(entry)
             self.history.append(entry)
@@ -1612,6 +1661,7 @@ class PostyMainWindow(QMainWindow):
             "body_type": self.body_type_combo.currentText(),
             "body": self.body_text.toPlainText(),
             "auth": self.get_auth_config(),
+            "attachments": self._attachments_snapshot(),
         }
         coll.append(req)
         save_document("collections", self.collections)
@@ -1629,6 +1679,7 @@ class PostyMainWindow(QMainWindow):
             "body_type": self.body_type_combo.currentText(),
             "body": self.body_text.toPlainText(),
             "auth": self.get_auth_config(),
+            "attachments": self._attachments_snapshot(),
         }
         try:
             Path(fname).write_text(json.dumps(req, indent=2))
@@ -1647,6 +1698,7 @@ class PostyMainWindow(QMainWindow):
             self.headers_text.setPlainText(data.get("headers", ""))
             self.body_type_combo.setCurrentText(data.get("body_type", "Raw"))
             self.body_text.setPlainText(data.get("body", ""))
+            self.restore_attachments(data.get("attachments", []))
             self.set_auth_config(data.get("auth", {}))
             QMessageBox.information(self, "Loaded", f"Request loaded from {fname}")
         except Exception as e:
@@ -1686,6 +1738,7 @@ class PostyMainWindow(QMainWindow):
                 self.headers_text.setPlainText(req.get("headers", ""))
                 self.body_type_combo.setCurrentText(req.get("body_type", "Raw"))
                 self.body_text.setPlainText(req.get("body", ""))
+                self.restore_attachments(req.get("attachments", []))
                 self.set_auth_config(req.get("auth", {}))
                 QMessageBox.information(self, "Loaded", f"Loaded request from collection '{coll}'")
             except Exception as e:
@@ -1716,6 +1769,9 @@ class PostyMainWindow(QMainWindow):
         if data.get("body_type"):
             self.body_type_combo.setCurrentText(data.get("body_type"))
         self.body_text.setPlainText(data.get("request_body", ""))
+
+        # Restore attachments (multipart/form-data files)
+        self.restore_attachments(data.get("attachments", []))
 
         # Restore auth configuration
         if "auth" in data:
