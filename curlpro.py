@@ -26,10 +26,11 @@ from PyQt6.QtWidgets import (
     QSplitter, QMessageBox, QFileDialog, QTabWidget, QListWidgetItem,
     QInputDialog, QTreeWidget, QTreeWidgetItem, QFrame, QScrollArea,
     QGroupBox, QDialog, QDialogButtonBox, QProgressBar, QStatusBar,
-    QToolButton, QMenu, QPlainTextEdit, QStackedWidget
+    QToolButton, QMenu, QPlainTextEdit, QStackedWidget,
+    QTableWidget, QTableWidgetItem, QHeaderView, QSpinBox, QWidgetAction
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QClipboard, QColor, QShortcut, QKeySequence, QFont
+from PyQt6.QtGui import QClipboard, QColor, QShortcut, QKeySequence, QFont, QPixmap
 
 # ---------------------------
 # Storage (SQLite, single file in the data dir)
@@ -299,6 +300,462 @@ class RequestThread(QThread):
             except Exception:
                 pass
 # ---------------------------
+# Stress test worker & dialog
+# ---------------------------
+_STRESS_SCRIPT_TEMPLATE = """\
+# Pre-request script  —  runs before every stress-test request.
+# Available globals: requests, json, random, uuid, time, threading
+# (also Faker / faker if the 'faker' package is installed)
+#
+# Define either or both of these functions:
+#
+#   setup(ctx)           — called ONCE before the test starts.
+#                          Use it to fetch tokens, open DB connections, etc.
+#                          ctx is a shared dict available to every call.
+#                          ctx['_lock'] is a threading.Lock() you can use freely.
+#
+#   before_request(ctx)  — called before EACH request (from worker threads).
+#                          Return a dict with any subset of:
+#                            headers   – merged on top of the configured headers
+#                            json_body – replaces the configured JSON body
+#                            data      – replaces form/raw data
+#                            params    – replaces query params
+#
+# ── Example 1: Bearer token fetched once, auto-refreshed on expiry ──────────
+# def setup(ctx):
+#     _fetch_token(ctx)
+#
+# def _fetch_token(ctx):
+#     r = requests.post('https://auth.example.com/token',
+#                       json={'username': 'admin', 'password': 'secret'})
+#     ctx['token']   = r.json()['access_token']
+#     ctx['expires'] = time.time() + 3500   # refresh 100 s before 1 h expiry
+#
+# def before_request(ctx):
+#     with ctx['_lock']:
+#         if time.time() >= ctx.get('expires', 0):
+#             _fetch_token(ctx)
+#         token = ctx['token']
+#     return {'headers': {'Authorization': f'Bearer {token}'}}
+#
+# ── Example 2: unique fake email in every request body ──────────────────────
+# def before_request(ctx):
+#     email = f'user_{uuid.uuid4().hex[:10]}@stress.example.com'
+#     return {'json_body': {'email': email, 'name': 'Test User'}}
+#
+# ── Example 3: combine both ─────────────────────────────────────────────────
+# def setup(ctx):
+#     _fetch_token(ctx)
+#
+# def _fetch_token(ctx):
+#     r = requests.post('https://auth.example.com/token',
+#                       json={'username': 'admin', 'password': 'secret'})
+#     ctx['token']   = r.json()['access_token']
+#     ctx['expires'] = time.time() + 3500
+#
+# def before_request(ctx):
+#     with ctx['_lock']:
+#         if time.time() >= ctx.get('expires', 0):
+#             _fetch_token(ctx)
+#         token = ctx['token']
+#     email = f'user_{uuid.uuid4().hex[:10]}@stress.example.com'
+#     return {
+#         'headers':   {'Authorization': f'Bearer {token}'},
+#         'json_body': {'email': email},
+#     }
+"""
+
+
+class StressTestWorker(QThread):
+    progress = pyqtSignal(int, int)   # completed, total
+    result_ready = pyqtSignal(dict)
+    all_done = pyqtSignal(dict)
+    script_error = pyqtSignal(str)
+
+    def __init__(self, config, total, concurrency, script_fns=None):
+        super().__init__()
+        self.config = config
+        self.total = total
+        self.concurrency = concurrency
+        self._stop = False
+        self._script_fns = script_fns or {}
+        self._ctx = {}
+
+    def stop(self):
+        self._stop = True
+
+    def _do_request(self, overrides=None):
+        if self._stop:
+            return {'status': 0, 'elapsed': 0, 'error': 'stopped'}
+        t0 = time.time()
+        cfg = self.config
+        headers = dict(cfg.get('headers', {}))
+        json_body = cfg.get('json_body')
+        data = cfg.get('data')
+        params = cfg.get('params')
+        if overrides:
+            if 'headers' in overrides:
+                headers.update(overrides['headers'])
+            if 'json_body' in overrides:
+                json_body = overrides['json_body']
+            if 'data' in overrides:
+                data = overrides['data']
+            if 'params' in overrides:
+                params = overrides['params']
+        try:
+            resp = requests.request(
+                cfg['method'], cfg['url'],
+                headers=headers,
+                json=json_body,
+                data=data,
+                params=params,
+                auth=cfg.get('auth'),
+                timeout=cfg.get('timeout', 30),
+            )
+            return {'status': resp.status_code, 'elapsed': (time.time() - t0) * 1000, 'error': None}
+        except Exception as e:
+            return {'status': 0, 'elapsed': (time.time() - t0) * 1000, 'error': str(e)}
+
+    def _call_before_request(self):
+        fn = self._script_fns.get('before_request')
+        if not fn:
+            return None
+        try:
+            return fn(self._ctx) or {}
+        except Exception as e:
+            return {'_script_error': str(e)}
+
+    def run(self):
+        import concurrent.futures as cf
+        import threading as _threading
+
+        self._ctx = {'_lock': _threading.Lock()}
+
+        setup_fn = self._script_fns.get('setup')
+        if setup_fn:
+            try:
+                setup_fn(self._ctx)
+            except Exception as e:
+                self.script_error.emit(f"setup() raised: {e}")
+                self.all_done.emit({'total': 0, 'requested': self.total,
+                                    'success': 0, 'errors': 0, 'wall_ms': 0, 'rps': 0})
+                return
+
+        results = []
+        t_wall = time.time()
+
+        def task():
+            overrides = self._call_before_request()
+            return self._do_request(overrides)
+
+        with cf.ThreadPoolExecutor(max_workers=self.concurrency) as ex:
+            futs = [ex.submit(task) for _ in range(self.total)]
+            for fut in cf.as_completed(futs):
+                r = fut.result()
+                if r.get('error') != 'stopped':
+                    results.append(r)
+                    self.result_ready.emit(dict(r))
+                self.progress.emit(len(results), self.total)
+                if self._stop:
+                    break
+
+        wall_ms = (time.time() - t_wall) * 1000
+        if results:
+            times = [r['elapsed'] for r in results]
+            st = sorted(times)
+            n = len(st)
+            statuses = {}
+            for r in results:
+                statuses[r['status']] = statuses.get(r['status'], 0) + 1
+            summary = {
+                'total': n,
+                'requested': self.total,
+                'success': sum(1 for r in results if r['error'] is None and 200 <= r['status'] < 400),
+                'errors': sum(1 for r in results if r['error'] is not None),
+                'min_ms': st[0],
+                'max_ms': st[-1],
+                'avg_ms': sum(times) / n,
+                'p50_ms': st[n // 2],
+                'p95_ms': st[max(0, int(n * 0.95) - 1)],
+                'statuses': statuses,
+                'wall_ms': wall_ms,
+                'rps': n / (wall_ms / 1000) if wall_ms > 0 else 0,
+            }
+        else:
+            summary = {'total': 0, 'requested': self.total, 'success': 0, 'errors': 0,
+                       'wall_ms': wall_ms, 'rps': 0}
+        self.all_done.emit(summary)
+
+
+class StressTestDialog(QDialog):
+    def __init__(self, request_config, parent=None):
+        super().__init__(parent)
+        self.request_config = request_config
+        self.worker = None
+        self._results = []
+        self.setWindowTitle("Stress Test")
+        self.resize(760, 700)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Config group
+        config_group = QGroupBox("Configuration")
+        cg = QVBoxLayout(config_group)
+
+        target_row = QHBoxLayout()
+        target_row.addWidget(QLabel("Target:"))
+        tl = QLabel(f"  {self.request_config['method']}  {self.request_config['url']}")
+        tl.setWordWrap(True)
+        font = tl.font()
+        font.setBold(True)
+        tl.setFont(font)
+        target_row.addWidget(tl, 1)
+        cg.addLayout(target_row)
+
+        params_row = QHBoxLayout()
+        params_row.addWidget(QLabel("Total requests:"))
+        self.total_spin = QSpinBox()
+        self.total_spin.setRange(1, 10000000)
+        self.total_spin.setValue(100)
+        self.total_spin.setFixedWidth(100)
+        params_row.addWidget(self.total_spin)
+        params_row.addSpacing(24)
+        params_row.addWidget(QLabel("Concurrency:"))
+        self.concurrency_spin = QSpinBox()
+        self.concurrency_spin.setRange(1, 10000)
+        self.concurrency_spin.setValue(10)
+        self.concurrency_spin.setFixedWidth(100)
+        params_row.addWidget(self.concurrency_spin)
+        params_row.addStretch()
+        cg.addLayout(params_row)
+        layout.addWidget(config_group)
+
+        # Script group
+        script_group = QGroupBox("Pre-request Script  (optional)")
+        script_group.setCheckable(True)
+        script_group.setChecked(False)
+        sl = QVBoxLayout(script_group)
+
+        self.script_editor = QPlainTextEdit()
+        self.script_editor.setFont(_monospace_font(9))
+        self.script_editor.setPlaceholderText(_STRESS_SCRIPT_TEMPLATE)
+        self.script_editor.setMinimumHeight(180)
+        sl.addWidget(self.script_editor)
+
+        script_btn_row = QHBoxLayout()
+        verify_btn = QPushButton("Verify Script")
+        verify_btn.setFixedHeight(30)
+        verify_btn.clicked.connect(self._verify_script)
+        clear_btn = QPushButton("Load Template")
+        clear_btn.setFixedHeight(30)
+        clear_btn.clicked.connect(lambda: self.script_editor.setPlainText(_STRESS_SCRIPT_TEMPLATE))
+        self.script_status = QLabel("")
+        self.script_status.setStyleSheet("color: #28a745;")
+        script_btn_row.addWidget(verify_btn)
+        script_btn_row.addWidget(clear_btn)
+        script_btn_row.addWidget(self.script_status, 1)
+        sl.addLayout(script_btn_row)
+        layout.addWidget(script_group)
+        self._script_group = script_group
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        self.run_btn = QPushButton("Run Stress Test")
+        self.run_btn.setFixedHeight(36)
+        self.run_btn.clicked.connect(self.run_test)
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setFixedHeight(36)
+        self.stop_btn.clicked.connect(self.stop_test)
+        self.stop_btn.setEnabled(False)
+        btn_row.addWidget(self.run_btn)
+        btn_row.addWidget(self.stop_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        # Progress
+        self.progress_label = QLabel("Ready — configure above and click Run")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_label)
+        layout.addWidget(self.progress_bar)
+
+        # Results
+        results_group = QGroupBox("Results")
+        rl = QVBoxLayout(results_group)
+
+        self.stats_label = QLabel("—")
+        self.stats_label.setWordWrap(True)
+        f2 = self.stats_label.font()
+        f2.setFamily("Consolas")
+        self.stats_label.setFont(f2)
+        rl.addWidget(self.stats_label)
+
+        self.status_table = QTableWidget(0, 3)
+        self.status_table.setHorizontalHeaderLabels(["Status", "Count", "%"])
+        sh = self.status_table.horizontalHeader()
+        sh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        sh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        sh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.status_table.setMaximumHeight(160)
+        self.status_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        rl.addWidget(self.status_table)
+        layout.addWidget(results_group)
+
+    # ---------- Script helpers ----------
+
+    def _compile_script(self, code):
+        """Exec script and return dict of extracted callables, or raise on error."""
+        import uuid as _uuid, random as _random, threading as _threading
+        ns = {
+            'requests': requests,
+            'json': json,
+            'random': _random,
+            'uuid': _uuid,
+            'time': time,
+            'threading': _threading,
+        }
+        try:
+            import faker as _faker
+            ns['Faker'] = _faker.Faker
+            ns['faker'] = _faker.Faker()
+        except ImportError:
+            pass
+        exec(compile(code, '<stress_script>', 'exec'), ns)
+        return {name: ns[name] for name in ('setup', 'before_request')
+                if name in ns and callable(ns[name])}
+
+    def _verify_script(self):
+        code = self.script_editor.toPlainText().strip()
+        if not code:
+            self.script_status.setStyleSheet("color: #888;")
+            self.script_status.setText("(empty — no script will run)")
+            return
+        try:
+            fns = self._compile_script(code)
+            names = list(fns.keys()) or ['(no functions defined)']
+            self.script_status.setStyleSheet("color: #28a745;")
+            self.script_status.setText(f"OK — found: {', '.join(names)}")
+        except Exception as e:
+            self.script_status.setStyleSheet("color: #dc3545;")
+            self.script_status.setText(f"Error: {e}")
+
+    # ---------- Run ----------
+
+    def run_test(self):
+        script_fns = {}
+        if self._script_group.isChecked():
+            code = self.script_editor.toPlainText().strip()
+            if code:
+                try:
+                    script_fns = self._compile_script(code)
+                except Exception as e:
+                    QMessageBox.critical(self, "Script Error",
+                                         f"Cannot compile pre-request script:\n{e}")
+                    return
+
+        self._results = []
+        self.status_table.setRowCount(0)
+        self.stats_label.setText("—")
+        total = self.total_spin.value()
+        concurrency = self.concurrency_spin.value()
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText(f"0 / {total}")
+        self.run_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+
+        self.worker = StressTestWorker(self.request_config, total, concurrency, script_fns)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.result_ready.connect(self._on_result)
+        self.worker.all_done.connect(self._on_done)
+        self.worker.script_error.connect(self._on_script_error)
+        self.worker.start()
+
+    def stop_test(self):
+        if self.worker:
+            self.worker.stop()
+        self.stop_btn.setEnabled(False)
+
+    # ---------- Slots ----------
+
+    def _on_script_error(self, msg):
+        QMessageBox.critical(self, "Script Runtime Error", msg)
+
+    def _on_progress(self, completed, total):
+        self.progress_bar.setValue(completed)
+        self.progress_label.setText(f"{completed} / {total} completed")
+
+    def _on_result(self, result):
+        self._results.append(result)
+        n = self.total_spin.value()
+        if len(self._results) % max(1, n // 20) == 0:
+            self._refresh_stats()
+
+    def _on_done(self, summary):
+        self.run_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self._refresh_stats()
+        wall = summary.get('wall_ms', 0)
+        rps = summary.get('rps', 0)
+        total = summary.get('total', 0)
+        self.progress_label.setText(
+            f"Done — {total} requests in {wall:.0f} ms  ({rps:.1f} req/s)"
+        )
+
+    def _refresh_stats(self):
+        rs = self._results
+        if not rs:
+            return
+        times = [r['elapsed'] for r in rs]
+        st = sorted(times)
+        n = len(st)
+        p95 = st[max(0, int(n * 0.95) - 1)]
+        p50 = st[n // 2]
+        successes = sum(1 for r in rs if r['error'] is None and 200 <= r['status'] < 400)
+        errors = sum(1 for r in rs if r['error'] is not None)
+
+        self.stats_label.setText(
+            f"Completed: {n}   Success: {successes}   Errors: {errors}\n"
+            f"Avg: {sum(times)/n:.1f} ms   Min: {st[0]:.1f} ms   "
+            f"Max: {st[-1]:.1f} ms   P50: {p50:.1f} ms   P95: {p95:.1f} ms"
+        )
+
+        statuses = {}
+        for r in rs:
+            statuses[r['status']] = statuses.get(r['status'], 0) + 1
+
+        self.status_table.setRowCount(0)
+        for status, count in sorted(statuses.items()):
+            row = self.status_table.rowCount()
+            self.status_table.insertRow(row)
+            label = str(status) if status > 0 else 'Network Error'
+            si = QTableWidgetItem(label)
+            ci = QTableWidgetItem(str(count))
+            pi = QTableWidgetItem(f"{count/n*100:.1f}%")
+            for item in (si, ci, pi):
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if status == 0 or status >= 400:
+                color = QColor('#dc3545')
+            elif 200 <= status < 300:
+                color = QColor('#28a745')
+            else:
+                color = QColor('#fd7e14')
+            for item in (si, ci, pi):
+                item.setForeground(color)
+            self.status_table.setItem(row, 0, si)
+            self.status_table.setItem(row, 1, ci)
+            self.status_table.setItem(row, 2, pi)
+
+    def closeEvent(self, event):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait(2000)
+        super().closeEvent(event)
+
+
+# ---------------------------
 # Environment dialog
 # ---------------------------
 class EnvironmentDialog(QDialog):
@@ -543,6 +1000,44 @@ class MultiSnippetDialog(QDialog):
             QMessageBox.critical(self, "Save Error", str(e))
 
 
+class SaveToCollectionDialog(QDialog):
+    """Pick an existing collection or type a new name."""
+    def __init__(self, existing_collections: list, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Save to Collection")
+        self.setMinimumWidth(340)
+        layout = QVBoxLayout(self)
+
+        if existing_collections:
+            layout.addWidget(QLabel("Select an existing collection:"))
+            self.list_widget = QListWidget()
+            self.list_widget.addItems(existing_collections)
+            self.list_widget.setMaximumHeight(140)
+            self.list_widget.itemClicked.connect(
+                lambda item: self.name_edit.setText(item.text())
+            )
+            layout.addWidget(self.list_widget)
+        else:
+            self.list_widget = None
+
+        layout.addWidget(QLabel("Collection name:"))
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("Type a name or select above")
+        layout.addWidget(self.name_edit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.name_edit.returnPressed.connect(self.accept)
+
+    def collection_name(self) -> str:
+        return self.name_edit.text().strip()
+
+
 class SnippetDialog(QDialog):
     """Simple dialog to show generated code and allow copying"""
     def __init__(self, title, snippet, parent=None):
@@ -606,7 +1101,8 @@ class CurlProMainWindow(QMainWindow):
         self._last_response = None          # requests.Response
         self._last_response_bytes = b""     # raw body
 
-        self.request_thread = None
+        self._request_store = {}   # req_id -> {thread, info, snapshot, result, error, elapsed}
+        self._req_counter = 0
         self.file_attachments = []  # [{field, path, filename, mime}]
 
         self.init_ui()
@@ -766,45 +1262,49 @@ class CurlProMainWindow(QMainWindow):
         self.send_btn.setFixedHeight(36)
         self.send_btn.clicked.connect(self.send_request)
 
-        save_menu = QMenu()
-        save_menu.addAction("Save to Collection", self.save_to_collection)
-        save_menu.addAction("Save as File", self.save_request_file)
+        self.timeout_spin = QSpinBox()
+        self.timeout_spin.setRange(0, 86400)
+        self.timeout_spin.setSuffix(" s")
+        self.timeout_spin.setSpecialValueText("∞  (no timeout)")
+        self.timeout_spin.setValue(self.settings.get("request_timeout", 30))
+        self.timeout_spin.setFixedWidth(120)
+        self.timeout_spin.setToolTip("Request timeout (0 = no timeout, max 86400 s / 24 h)")
 
-        self.save_btn = QToolButton()
-        self.save_btn.setText("Save")
-        self.save_btn.setMenu(save_menu)
-        self.save_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
-        self.save_btn.setFixedHeight(36)
+        timeout_widget = QWidget()
+        timeout_row = QHBoxLayout(timeout_widget)
+        timeout_row.setContentsMargins(8, 4, 8, 4)
+        timeout_row.addWidget(QLabel("Timeout:"))
+        timeout_row.addWidget(self.timeout_spin)
 
-        load_btn = QPushButton("Load")
-        load_btn.setFixedHeight(36)
-        load_btn.clicked.connect(self.load_request_file)
+        timeout_action = QWidgetAction(self)
+        timeout_action.setDefaultWidget(timeout_widget)
 
-        # Generate menu (snippets)
-        generate_menu = QMenu()
-        generate_menu.addAction("All Languages…", self.generate_all_and_show)
-        generate_menu.addSeparator()
-        generate_menu.addAction("curl", lambda: self.generate_code_and_show("curl"))
-        generate_menu.addAction("python-requests", lambda: self.generate_code_and_show("python-requests"))
-        generate_menu.addAction("powershell", lambda: self.generate_code_and_show("powershell"))
-        generate_menu.addAction("java", lambda: self.generate_code_and_show("java"))
-        generate_menu.addAction("axios", lambda: self.generate_code_and_show("axios"))
+        actions_menu = QMenu()
+        actions_menu.addAction("Save to Collection", self.save_to_collection)
+        actions_menu.addAction("Save as File", self.save_request_file)
+        actions_menu.addAction("Load", self.load_request_file)
+        actions_menu.addSeparator()
+        actions_menu.addAction("Generate — All Languages…", self.generate_all_and_show)
+        actions_menu.addAction("Generate — curl", lambda: self.generate_code_and_show("curl"))
+        actions_menu.addAction("Generate — python-requests", lambda: self.generate_code_and_show("python-requests"))
+        actions_menu.addAction("Generate — powershell", lambda: self.generate_code_and_show("powershell"))
+        actions_menu.addAction("Generate — java", lambda: self.generate_code_and_show("java"))
+        actions_menu.addAction("Generate — axios", lambda: self.generate_code_and_show("axios"))
+        actions_menu.addSeparator()
+        actions_menu.addAction("Stress Test…", self.open_stress_test)
+        actions_menu.addSeparator()
+        actions_menu.addAction(timeout_action)
 
-        self.generate_btn = QToolButton()
-        self.generate_btn.setText("Generate")
-        self.generate_btn.setMenu(generate_menu)
-        self.generate_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
-        self.generate_btn.setFixedHeight(36)
-        self.generate_btn.setToolTip("Click for all languages, or use the ▾ menu for one.")
-        # Clicking the button body (not the arrow) opens the all-languages view.
-        self.generate_btn.clicked.connect(self.generate_all_and_show)
+        self.actions_btn = QToolButton()
+        self.actions_btn.setText("Options ▾")
+        self.actions_btn.setMenu(actions_menu)
+        self.actions_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.actions_btn.setFixedHeight(36)
 
         url_layout.addWidget(self.method_combo)
         url_layout.addWidget(self.url_input, 1)
         url_layout.addWidget(self.send_btn)
-        url_layout.addWidget(self.save_btn)
-        url_layout.addWidget(load_btn)
-        url_layout.addWidget(self.generate_btn)
+        url_layout.addWidget(self.actions_btn)
 
         request_layout.addLayout(url_layout)
 
@@ -899,6 +1399,26 @@ class CurlProMainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         right_layout.addWidget(self.progress_bar)
 
+        # Active Requests panel
+        active_group = QGroupBox("Active Requests")
+        active_group.setMaximumHeight(155)
+        active_layout_inner = QVBoxLayout(active_group)
+        active_layout_inner.setContentsMargins(4, 4, 4, 4)
+        self.active_requests_table = QTableWidget(0, 5)
+        self.active_requests_table.setHorizontalHeaderLabels(["#", "Method", "URL", "Status", "ms"])
+        hdr = self.active_requests_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.active_requests_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.active_requests_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.active_requests_table.cellDoubleClicked.connect(self._on_active_request_double_clicked)
+        self.active_requests_table.setToolTip("Double-click a completed request to view its response")
+        active_layout_inner.addWidget(self.active_requests_table)
+        right_layout.addWidget(active_group)
+
         # --- Response group ---
         response_group = QGroupBox("Response")
         response_layout = QVBoxLayout(response_group)
@@ -920,6 +1440,14 @@ class CurlProMainWindow(QMainWindow):
         self.response_headers = QTextEdit()
         self.response_headers.setReadOnly(True)
         self.response_tabs.addTab(self.response_headers, "Headers")
+
+        self.response_preview_label = QLabel("No preview available")
+        self.response_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.response_preview_label.setMinimumSize(100, 100)
+        preview_scroll = QScrollArea()
+        preview_scroll.setWidget(self.response_preview_label)
+        preview_scroll.setWidgetResizable(True)
+        self.response_tabs.addTab(preview_scroll, "Preview")
 
         response_layout.addWidget(self.response_tabs)
         # Download toolbar
@@ -1177,20 +1705,52 @@ class CurlProMainWindow(QMainWindow):
         self.setFont(font)
     # ---------- Download helpers ----------
     def _infer_ext_from_content_type(self, ct: str) -> str:
-        ct = (ct or "").lower()
-        if "application/pdf" in ct:
-            return ".pdf"
-        if "image/png" in ct:
-            return ".png"
-        if "image/jpeg" in ct or "image/jpg" in ct:
-            return ".jpg"
-        if "image/webp" in ct:
-            return ".webp"
-        if "image/gif" in ct:
-            return ".gif"
-        if "image/bmp" in ct:
-            return ".bmp"
-        return ""
+        ct = (ct or "").lower().split(";")[0].strip()
+        ext_map = {
+            "application/pdf": ".pdf",
+            "image/png": ".png",
+            "image/jpeg": ".jpg",
+            "image/jpg": ".jpg",
+            "image/webp": ".webp",
+            "image/gif": ".gif",
+            "image/bmp": ".bmp",
+            "image/svg+xml": ".svg",
+            "image/tiff": ".tiff",
+            "image/x-icon": ".ico",
+            "image/heic": ".heic",
+            "video/mp4": ".mp4",
+            "video/mpeg": ".mpeg",
+            "video/webm": ".webm",
+            "video/quicktime": ".mov",
+            "video/x-msvideo": ".avi",
+            "video/x-matroska": ".mkv",
+            "video/x-flv": ".flv",
+            "video/x-ms-wmv": ".wmv",
+            "audio/mpeg": ".mp3",
+            "audio/wav": ".wav",
+            "audio/ogg": ".ogg",
+            "audio/flac": ".flac",
+            "audio/aac": ".aac",
+            "audio/mp4": ".m4a",
+            "application/zip": ".zip",
+            "application/x-zip-compressed": ".zip",
+            "application/x-tar": ".tar",
+            "application/gzip": ".gz",
+            "application/x-gzip": ".gz",
+            "application/x-rar-compressed": ".rar",
+            "application/x-7z-compressed": ".7z",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+            "application/msword": ".doc",
+            "application/vnd.ms-excel": ".xls",
+            "application/vnd.ms-powerpoint": ".ppt",
+            "application/octet-stream": ".bin",
+            "text/csv": ".csv",
+            "text/xml": ".xml",
+            "application/xml": ".xml",
+        }
+        return ext_map.get(ct, "")
 
     def _infer_filename_from_headers(self, response) -> str:
         # Try Content-Disposition filename
@@ -1268,6 +1828,134 @@ class CurlProMainWindow(QMainWindow):
         walker(obj)
         # return first candidate if present
         return candidates[0] if candidates else (None, "")
+
+    def _is_binary_content_type(self, ct: str) -> bool:
+        ct = (ct or "").lower().split(";")[0].strip()
+        return any(ct.startswith(p) for p in [
+            "image/", "video/", "audio/", "application/pdf",
+            "application/zip", "application/x-zip", "application/octet-stream",
+            "application/vnd.openxmlformats", "application/msword",
+            "application/vnd.ms-", "application/x-tar", "application/gzip",
+            "application/x-rar", "application/x-7z",
+        ])
+
+    def _refresh_progress(self):
+        running = sum(1 for s in self._request_store.values() if s['thread'].isRunning())
+        self.progress_bar.setVisible(running > 0)
+        if running > 0:
+            self.progress_bar.setRange(0, 0)
+
+    def _update_active_table(self):
+        self.active_requests_table.setRowCount(0)
+        for req_id, store in self._request_store.items():
+            info = store['info']
+            row = self.active_requests_table.rowCount()
+            self.active_requests_table.insertRow(row)
+
+            id_item = QTableWidgetItem(str(req_id + 1))
+            id_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.active_requests_table.setItem(row, 0, id_item)
+
+            method_item = QTableWidgetItem(info['method'])
+            method_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.active_requests_table.setItem(row, 1, method_item)
+
+            url_item = QTableWidgetItem(info['url'])
+            url_item.setData(Qt.ItemDataRole.UserRole, req_id)
+            self.active_requests_table.setItem(row, 2, url_item)
+
+            if store['result'] is not None:
+                status = store['result']['response'].status_code
+                status_item = QTableWidgetItem(str(status))
+                status_item.setForeground(QColor('#28a745' if status < 400 else '#dc3545'))
+            elif store['error'] is not None:
+                status_item = QTableWidgetItem('Error')
+                status_item.setForeground(QColor('#dc3545'))
+            else:
+                status_item = QTableWidgetItem('Running...')
+                status_item.setForeground(QColor('#fd7e14'))
+            status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.active_requests_table.setItem(row, 3, status_item)
+
+            elapsed = store['elapsed']
+            time_item = QTableWidgetItem(f"{elapsed:.0f}" if elapsed is not None else '...')
+            time_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.active_requests_table.setItem(row, 4, time_item)
+
+        self.active_requests_table.scrollToBottom()
+
+    def _on_active_request_double_clicked(self, row, col):
+        url_item = self.active_requests_table.item(row, 2)
+        if url_item is None:
+            return
+        req_id = url_item.data(Qt.ItemDataRole.UserRole)
+        store = self._request_store.get(req_id)
+        if store is None:
+            return
+        if store['result'] is not None:
+            self._load_response_to_ui(store['result'])
+        elif store['error'] is not None:
+            QMessageBox.critical(self, "Request Error", f"Request #{req_id + 1} failed:\n{store['error']}")
+        else:
+            QMessageBox.information(self, "In Progress", f"Request #{req_id + 1} is still running.")
+
+    def _load_response_to_ui(self, result):
+        response = result['response']
+        elapsed = result['elapsed']
+        status_code = response.status_code
+        status_text = response.reason
+        size = len(response.content)
+
+        self._last_response = response
+        self._last_response_bytes = response.content or b""
+
+        self.response_summary.setText(
+            f"Status: {status_code} {status_text} — Time: {elapsed*1000:.0f} ms — Size: {size:,} bytes"
+        )
+
+        self.response_headers.setPlainText(
+            "\n".join(f"{k}: {v}" for k, v in response.headers.items())
+        )
+        raw_text = response.text
+        self.response_raw.setPlainText(raw_text)
+
+        content_type = response.headers.get("Content-Type", "").lower()
+        image_types = ["image/png", "image/jpeg", "image/jpg", "image/webp",
+                       "image/gif", "image/bmp", "image/tiff"]
+
+        if any(x in content_type for x in image_types):
+            pixmap = QPixmap()
+            pixmap.loadFromData(response.content)
+            if not pixmap.isNull():
+                w = max(self.response_preview_label.width(), 400)
+                h = max(self.response_preview_label.height(), 400)
+                scaled = pixmap.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatio,
+                                       Qt.TransformationMode.SmoothTransformation)
+                self.response_preview_label.setPixmap(scaled)
+                self.response_tabs.setCurrentIndex(3)
+            else:
+                self.response_preview_label.setText("Could not decode image")
+        else:
+            self.response_preview_label.setText("No preview available")
+
+        if self._is_binary_content_type(content_type) and not any(x in content_type for x in image_types):
+            ext = self._infer_ext_from_content_type(content_type) or ".bin"
+            self.response_pretty.setPlainText(
+                f"[Binary content: {content_type}]\n"
+                f"Size: {size:,} bytes\n\n"
+                f"Use 'Save Response Body…' to save this file.\n"
+                f"Suggested extension: {ext}"
+            )
+        elif "application/json" in content_type or raw_text.strip().startswith(("{", "[")):
+            try:
+                if self.settings.get("auto_format_json", True):
+                    self.response_pretty.setPlainText(json.dumps(response.json(), indent=2))
+                else:
+                    self.response_pretty.setPlainText(raw_text)
+            except Exception:
+                self.response_pretty.setPlainText(raw_text)
+        else:
+            self.response_pretty.setPlainText(raw_text)
 
     # ---------- Collections & History ----------
     def reload_collections(self):
@@ -1444,10 +2132,6 @@ class CurlProMainWindow(QMainWindow):
             self.attachments_group.setVisible(show_attachments)
 
     def send_request(self):
-        if self.request_thread and self.request_thread.isRunning():
-            QMessageBox.information(self, "Request in Progress", "Please wait for the current request to complete.")
-            return
-
         env_name = self.env_combo.currentText()
         env = self.envs.get(env_name, {})
 
@@ -1522,58 +2206,60 @@ class CurlProMainWindow(QMainWindow):
         params = {}
         auth_tuple = self.apply_auth(headers, params, env)
 
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 0)
-        self.send_btn.setEnabled(False)
-        self.send_btn.setText("Sending...")
-        self.status_bar.showMessage("Sending request...")
+        # Snapshot current UI inputs so history is accurate if the user edits
+        # the form while this request is in flight (multiple concurrent requests).
+        snapshot = {
+            'req_url': self.url_input.text(),
+            'req_headers_text': self.headers_text.toPlainText(),
+            'body_type': self.body_type_combo.currentText(),
+            'request_body': self.body_text.toPlainText(),
+            'auth': self.get_auth_config(),
+            'attachments': self._attachments_snapshot(),
+        }
 
-        timeout = self.settings.get("request_timeout", 30)
-        self.request_thread = RequestThread(
+        req_id = self._req_counter
+        self._req_counter += 1
+
+        raw_timeout = self.timeout_spin.value()
+        timeout = None if raw_timeout == 0 else raw_timeout
+        thread = RequestThread(
             method, url, headers, json_body, data, files, timeout,
             params=params or None, auth=auth_tuple
         )
-        self.request_thread.finished.connect(self.on_request_finished)
-        self.request_thread.error.connect(self.on_request_error)
-        self.request_thread.start()
+        self._request_store[req_id] = {
+            'thread': thread,
+            'info': {'method': method, 'url': url},
+            'snapshot': snapshot,
+            'result': None,
+            'error': None,
+            'elapsed': None,
+        }
+        thread.finished.connect(lambda result, rid=req_id: self.on_request_finished(result, rid))
+        thread.error.connect(lambda err, rid=req_id: self.on_request_error(err, rid))
+        thread.start()
 
-    def on_request_finished(self, result):
-        self.progress_bar.setVisible(False)
-        self.send_btn.setEnabled(True)
-        self.send_btn.setText("Send")
+        self._update_active_table()
+        self._refresh_progress()
+        self.status_bar.showMessage(f"Request #{req_id + 1} sent — {method} {url[:60]}")
+
+    def on_request_finished(self, result, req_id):
+        store = self._request_store.get(req_id, {})
+        if store:
+            store['result'] = result
+            store['elapsed'] = result['elapsed'] * 1000
+
+        self._update_active_table()
+        self._refresh_progress()
 
         response = result['response']
         elapsed = result['elapsed']
-        status_code = response.status_code
-        status_text = response.reason
-        size = len(response.content)
+        snapshot = store.get('snapshot', {}) if store else {}
 
-        self._last_response = response
-        self._last_response_bytes = response.content or b""
-
-        summary_html = f"Status: {status_code} {status_text} — Time: {elapsed*1000:.0f} ms — Size: {size:,} bytes"
-        self.response_summary.setText(summary_html)
-
-        headers_text = "\n".join(f"{k}: {v}" for k, v in response.headers.items())
-        self.response_headers.setPlainText(headers_text)
-        raw_text = response.text
-        self.response_raw.setPlainText(raw_text)
-
-        content_type = response.headers.get("Content-Type", "").lower()
-        if "application/json" in content_type or raw_text.strip().startswith(("{", "[")):
-            try:
-                if self.settings.get("auto_format_json", True):
-                    formatted_json = json.dumps(response.json(), indent=2)
-                    self.response_pretty.setPlainText(formatted_json)
-                else:
-                    self.response_pretty.setPlainText(raw_text)
-            except Exception:
-                self.response_pretty.setPlainText(raw_text)
-        else:
-            self.response_pretty.setPlainText(raw_text)
+        self._load_response_to_ui(result)
 
         # Save to history
         try:
+            raw_text = response.text
             req_obj = getattr(response, "request", None)
             entry = {
                 "timestamp": time.time(),
@@ -1585,15 +2271,14 @@ class CurlProMainWindow(QMainWindow):
                 "size": len(response.content),
                 "request_headers": dict(getattr(req_obj, "headers", {}) if req_obj is not None else {}),
                 "response_headers": dict(response.headers),
-                "request_body": self.body_text.toPlainText(),
+                "request_body": snapshot.get('request_body', self.body_text.toPlainText()),
                 "response_body_snippet": raw_text[:2000],
                 "response_body_full": raw_text,
-                # Original (unresolved) request inputs so the request can be fully restored
-                "req_url": self.url_input.text(),
-                "req_headers_text": self.headers_text.toPlainText(),
-                "body_type": self.body_type_combo.currentText(),
-                "auth": self.get_auth_config(),
-                "attachments": self._attachments_snapshot(),
+                "req_url": snapshot.get('req_url', self.url_input.text()),
+                "req_headers_text": snapshot.get('req_headers_text', self.headers_text.toPlainText()),
+                "body_type": snapshot.get('body_type', self.body_type_combo.currentText()),
+                "auth": snapshot.get('auth', self.get_auth_config()),
+                "attachments": snapshot.get('attachments', self._attachments_snapshot()),
             }
             entry["_id"] = add_history(entry)
             self.history.append(entry)
@@ -1601,24 +2286,34 @@ class CurlProMainWindow(QMainWindow):
         except Exception:
             pass
 
-        self.status_bar.showMessage(f"Completed: {status_code} ({elapsed*1000:.0f} ms)")
-        # Offer to save if it's clearly binary media
+        status_code = response.status_code
+        self.status_bar.showMessage(f"Request #{req_id + 1} done: {status_code} ({elapsed*1000:.0f} ms)")
+
+        # Offer to save non-image binary (images show in the Preview tab)
         ct = (response.headers.get("Content-Type", "") or "").lower()
-        if any(x in ct for x in ["application/pdf", "image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp"]):
+        if self._is_binary_content_type(ct) and "image/" not in ct:
             choice = QMessageBox.question(
                 self,
-                "Detected Binary Content",
-                f"Response looks like '{ct}'. Do you want to save it now?",
+                "Binary Response",
+                f"Response is binary content ({ct}, {len(response.content):,} bytes).\nSave it now?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
             if choice == QMessageBox.StandardButton.Yes:
                 self._save_response_body_bytes()
 
-    def on_request_error(self, error_message):
-        self.progress_bar.setVisible(False)
-        self.send_btn.setEnabled(True)
-        self.send_btn.setText("Send")
-        QMessageBox.critical(self, "Request Error", f"An error occurred while making the request:\n{error_message}")
+    def on_request_error(self, error_message, req_id):
+        store = self._request_store.get(req_id, {})
+        if store:
+            store['error'] = error_message
+            store['elapsed'] = 0
+
+        self._update_active_table()
+        self._refresh_progress()
+
+        snapshot = store.get('snapshot', {}) if store else {}
+        self.status_bar.showMessage(f"Request #{req_id + 1} failed: {error_message[:60]}")
+        QMessageBox.critical(self, "Request Error", f"Request #{req_id + 1} failed:\n{error_message}")
+
         try:
             entry = {
                 "timestamp": time.time(),
@@ -1630,27 +2325,28 @@ class CurlProMainWindow(QMainWindow):
                 "size": 0,
                 "request_headers": {},
                 "response_headers": {},
-                "request_body": self.body_text.toPlainText(),
+                "request_body": snapshot.get('request_body', self.body_text.toPlainText()),
                 "response_body_snippet": "",
                 "response_body_full": "",
-                # Original (unresolved) request inputs so the request can be fully restored
-                "req_url": self.url_input.text(),
-                "req_headers_text": self.headers_text.toPlainText(),
-                "body_type": self.body_type_combo.currentText(),
-                "auth": self.get_auth_config(),
-                "attachments": self._attachments_snapshot(),
+                "req_url": snapshot.get('req_url', self.url_input.text()),
+                "req_headers_text": snapshot.get('req_headers_text', self.headers_text.toPlainText()),
+                "body_type": snapshot.get('body_type', self.body_type_combo.currentText()),
+                "auth": snapshot.get('auth', self.get_auth_config()),
+                "attachments": snapshot.get('attachments', self._attachments_snapshot()),
             }
             entry["_id"] = add_history(entry)
             self.history.append(entry)
             self.reload_history()
         except Exception:
             pass
-        self.status_bar.showMessage("Error")
 
     # ---------- Save/Load ----------
     def save_to_collection(self):
-        name, ok = QInputDialog.getText(self, "Save to Collection", "Collection name:")
-        if not ok or not name:
+        dlg = SaveToCollectionDialog(sorted(self.collections.keys()), self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        name = dlg.collection_name()
+        if not name:
             return
         coll = self.collections.setdefault(name, [])
         req = {
@@ -2405,6 +3101,62 @@ class CurlProMainWindow(QMainWindow):
         lines.append("  }")
         lines.append("});")
         return "\n".join(lines)
+
+    # ---------- Stress test ----------
+    def open_stress_test(self):
+        env_name = self.env_combo.currentText()
+        env = self.envs.get(env_name, {})
+
+        url = apply_env(self.url_input.text().strip(), env)
+        if not url:
+            QMessageBox.warning(self, "Invalid URL", "Please enter a URL first.")
+            return
+
+        headers = {}
+        for line in self.headers_text.toPlainText().splitlines():
+            line = line.strip()
+            if line and ":" in line:
+                key, value = line.split(":", 1)
+                headers[key.strip()] = apply_env(value.strip(), env)
+
+        body_raw = apply_env(self.body_text.toPlainText().strip(), env)
+        json_body = None
+        data = None
+        body_type = self.body_type_combo.currentText()
+        content_type = headers.get("Content-Type", "").lower()
+
+        if body_type == "JSON" or "application/json" in content_type or (body_raw and body_raw.startswith(("{", "["))):
+            if body_raw:
+                try:
+                    json_body = json.loads(body_raw)
+                except Exception:
+                    pass
+        elif body_type == "Form Data":
+            data = {}
+            if body_raw:
+                for pair in body_raw.split("&"):
+                    if "=" in pair:
+                        k, v = pair.split("=", 1)
+                        data[k] = v
+        elif body_raw:
+            data = body_raw.encode("utf-8")
+
+        params = {}
+        auth_tuple = self.apply_auth(headers, params, env)
+
+        config = {
+            'method': self.method_combo.currentText(),
+            'url': url,
+            'headers': headers,
+            'json_body': json_body,
+            'data': data,
+            'params': params or None,
+            'auth': auth_tuple,
+            'timeout': None if self.timeout_spin.value() == 0 else self.timeout_spin.value(),
+        }
+
+        dlg = StressTestDialog(config, self)
+        dlg.show()
 
     # ---------- Lifecycle ----------
     def closeEvent(self, event):
