@@ -223,6 +223,114 @@ def apply_env(text: str, env: dict):
 
 
 # ---------------------------
+# curl command parsing
+# ---------------------------
+# Long/short curl flags that take NO argument — safe to skip while tokenising.
+_CURL_NOARG_FLAGS = {
+    "-i", "--include", "-s", "--silent", "-S", "--show-error", "-k", "--insecure",
+    "-L", "--location", "-v", "--verbose", "-f", "--fail", "--compressed",
+    "-#", "--progress-bar", "-g", "--globoff", "-N", "--no-buffer", "-#",
+    "-O", "--remote-name", "-j", "--junk-session-cookies", "--raw",
+}
+
+
+def looks_like_curl(text: str) -> bool:
+    """True if `text` looks like a pasted curl command (vs. a plain URL)."""
+    s = (text or "").strip().lower()
+    return s.startswith("curl ") or s.startswith("curl\n") or s == "curl" or s.startswith("curl\t")
+
+
+def parse_curl_command(text: str) -> dict:
+    """Parse a curl command line into request parts.
+
+    Returns a dict: method, url, headers (dict), data (str or None),
+    is_form (bool), form (list of "k=v" / "k=@file" strings),
+    user (str "u:p" or None).  Best-effort: unknown flags are skipped.
+    """
+    result = {
+        "method": None,
+        "url": None,
+        "headers": {},
+        "data_parts": [],
+        "is_form": False,
+        "form": [],
+        "user": None,
+        "get_with_data": False,
+    }
+
+    text = (text or "").strip()
+    if looks_like_curl(text):
+        # drop the leading "curl" word
+        text = text[4:]
+    # Collapse shell line-continuations (backslash + newline) into spaces.
+    text = re.sub(r"\\\r?\n", " ", text)
+    # Some single-line widgets flatten newlines before paste handlers see them,
+    # leaving continuations as "\ --url" / "\ -H" tokens.
+    text = re.sub(r"\\\s+(?=(?:-{1,2}[A-Za-z]|https?://))", " ", text)
+
+    try:
+        tokens = shlex.split(text, posix=True)
+    except ValueError:
+        # Unbalanced quotes etc. — retry without posix escaping.
+        try:
+            tokens = shlex.split(text, posix=False)
+        except ValueError:
+            tokens = text.split()
+
+    i, n = 0, len(tokens)
+
+    def take():
+        nonlocal i
+        i += 1
+        return tokens[i] if i < n else ""
+
+    while i < n:
+        tok = tokens[i]
+        if tok in ("-X", "--request"):
+            result["method"] = take().upper()
+        elif tok == "--url":
+            result["url"] = take()
+        elif tok in ("-H", "--header"):
+            h = take()
+            if ":" in h:
+                k, v = h.split(":", 1)
+                if k.strip():
+                    result["headers"][k.strip()] = v.strip()
+        elif tok in ("-A", "--user-agent"):
+            result["headers"]["User-Agent"] = take()
+        elif tok in ("-e", "--referer"):
+            result["headers"]["Referer"] = take()
+        elif tok in ("-b", "--cookie"):
+            result["headers"]["Cookie"] = take()
+        elif tok in ("-u", "--user"):
+            result["user"] = take()
+        elif tok in ("-d", "--data", "--data-raw", "--data-ascii",
+                     "--data-binary", "--data-urlencode"):
+            result["data_parts"].append(take())
+        elif tok in ("-F", "--form", "--form-string"):
+            result["is_form"] = True
+            result["form"].append(take())
+        elif tok in ("-G", "--get"):
+            result["get_with_data"] = True
+        elif tok in _CURL_NOARG_FLAGS:
+            pass
+        elif tok.startswith("-"):
+            # Unknown flag — skip it; don't guess whether it takes a value.
+            pass
+        else:
+            # First bare token is the URL.
+            if result["url"] is None:
+                result["url"] = tok
+        i += 1  # advance past this flag (take() already consumed any argument)
+
+    if result["data_parts"]:
+        result["data"] = "&".join(result["data_parts"])
+    else:
+        result["data"] = None
+    return result
+
+
+# ---------------------------
 # Network thread
 # ---------------------------
 class RequestThread(QThread):
@@ -1079,6 +1187,73 @@ class SnippetDialog(QDialog):
 
 
 # ---------------------------
+# URL bar that understands pasted curl commands
+# ---------------------------
+class UrlLineEdit(QLineEdit):
+    """QLineEdit for the URL bar.
+
+    When a curl command is pasted (which a single-line QLineEdit would otherwise
+    mangle by stripping newlines), the full original text is emitted via
+    `curlPasted` instead of being inserted, so the main window can import it.
+    """
+    curlPasted = pyqtSignal(str)
+
+    def _try_import_curl(self) -> bool:
+        """If the clipboard holds a curl command, emit it and report handled.
+
+        Reads the clipboard directly (rather than relying on the text Qt is
+        about to insert) so the original newlines survive — a single-line
+        QLineEdit strips them, which would corrupt a multi-line --data body.
+        """
+        text = QApplication.clipboard().text()
+        if looks_like_curl(text):
+            self.curlPasted.emit(text)
+            return True
+        return False
+
+    def keyPressEvent(self, event):
+        # QLineEdit.paste() is a non-virtual slot, so Ctrl+V never reaches our
+        # override below. Intercept the paste key sequence here instead — this
+        # is the path that actually fires for keyboard pastes.
+        if event.matches(QKeySequence.StandardKey.Paste) and self._try_import_curl():
+            return
+        super().keyPressEvent(event)
+
+    def contextMenuEvent(self, event):
+        # Reroute the right-click "Paste" entry through our curl check too.
+        menu = self.createStandardContextMenu()
+        paste_seq = QKeySequence(QKeySequence.StandardKey.Paste)
+        for act in menu.actions():
+            if act.shortcut() == paste_seq:
+                try:
+                    act.triggered.disconnect()
+                except TypeError:
+                    pass
+                act.triggered.connect(self._context_paste)
+        menu.exec(event.globalPos())
+        menu.deleteLater()
+
+    def _context_paste(self):
+        if not self._try_import_curl():
+            super().paste()
+
+    def paste(self):
+        if not self._try_import_curl():
+            super().paste()
+
+    def insertFromMimeData(self, source):
+        text = source.text() if source is not None and source.hasText() else ""
+        if looks_like_curl(text):
+            self.curlPasted.emit(text)
+            return
+        handler = getattr(super(), "insertFromMimeData", None)
+        if handler:
+            handler(source)
+        elif text:
+            self.insert(text)
+
+
+# ---------------------------
 # Main window
 # ---------------------------
 class CurlProMainWindow(QMainWindow):
@@ -1254,8 +1429,10 @@ class CurlProMainWindow(QMainWindow):
         # Color the method so the request type is obvious at a glance.
         self.method_combo.currentTextChanged.connect(self._update_method_color)
 
-        self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText("Enter request URL e.g. https://api.example.com/v1/items   —   press Enter to send")
+        self.url_input = UrlLineEdit()
+        self.url_input.setPlaceholderText("Enter URL or paste a curl command   —   press Enter to send")
+        # Pasting a curl command imports it into the form instead of mangling it.
+        self.url_input.curlPasted.connect(self.import_curl)
         self.url_input.setClearButtonEnabled(True)
         self.url_input.setMinimumHeight(36)
         font = self.url_input.font()
@@ -2141,7 +2318,100 @@ class CurlProMainWindow(QMainWindow):
         if hasattr(self, "attachments_group"):
             self.attachments_group.setVisible(show_attachments)
 
+    def _update_method_color(self, *_args):
+        """Tint the method dropdown so the request type is obvious at a glance."""
+        colors = {
+            "GET": "#28a745", "POST": "#fd7e14", "PUT": "#0d6efd",
+            "PATCH": "#6f42c1", "DELETE": "#dc3545", "HEAD": "#6c757d",
+            "OPTIONS": "#6c757d",
+        }
+        method = self.method_combo.currentText()
+        color = colors.get(method, "#6c757d")
+        self.method_combo.setStyleSheet(f"QComboBox {{ color: {color}; font-weight: bold; }}")
+
+    def import_curl(self, text):
+        """Populate the request form from a pasted curl command."""
+        parsed = parse_curl_command(text)
+        if not parsed.get("url"):
+            # Couldn't find a URL — fall back to inserting the raw text so the
+            # user isn't left with an empty field.
+            self.url_input.setText(" ".join(text.split()))
+            self.status_bar.showMessage("Couldn't parse curl command — pasted as text")
+            return False
+
+        headers = dict(parsed["headers"])
+
+        # Method: explicit -X wins, otherwise infer from the presence of a body.
+        method = parsed["method"]
+        if not method:
+            if parsed["get_with_data"]:
+                method = "GET"
+            elif parsed["data"] or parsed["is_form"]:
+                method = "POST"
+            else:
+                method = "GET"
+        valid_methods = [self.method_combo.itemText(i) for i in range(self.method_combo.count())]
+        self.method_combo.setCurrentText(method if method in valid_methods else "GET")
+
+        self.url_input.setText(parsed["url"])
+
+        # Lift recognised auth out of the headers into the Auth tab.
+        auth_cfg = {"type": "No Auth"}
+        auth_header = next((k for k in headers if k.lower() == "authorization"), None)
+        if auth_header:
+            val = headers[auth_header].strip()
+            if val.lower().startswith("bearer "):
+                auth_cfg = {"type": "Bearer Token", "token": val[7:].strip()}
+                del headers[auth_header]
+        if parsed["user"]:
+            user, _, pwd = parsed["user"].partition(":")
+            auth_cfg = {"type": "Basic Auth", "username": user, "password": pwd}
+        self.set_auth_config(auth_cfg)
+
+        # Headers text — one "Key: Value" per line.
+        self.headers_text.setPlainText(
+            "\n".join(f"{k}: {v}" for k, v in headers.items())
+        )
+
+        # Body.
+        content_type = next((v for k, v in headers.items() if k.lower() == "content-type"), "").lower()
+        if parsed["is_form"]:
+            self.body_type_combo.setCurrentText("Form Data")
+            text_fields = [f for f in parsed["form"] if "=@" not in f and not f.startswith("@")]
+            self.body_text.setPlainText("&".join(text_fields))
+            file_fields = [f for f in parsed["form"] if f not in text_fields]
+            note = "  (file fields ignored — add them under Attachments)" if file_fields else ""
+            self.status_bar.showMessage(f"Imported curl — {method} {parsed['url'][:60]}{note}")
+        elif parsed["data"]:
+            body = parsed["data"]
+            is_json = "application/json" in content_type or body.lstrip().startswith(("{", "["))
+            if is_json:
+                self.body_type_combo.setCurrentText("JSON")
+                try:
+                    body = json.dumps(json.loads(body), indent=2)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            else:
+                self.body_type_combo.setCurrentText("Raw")
+            self.body_text.setPlainText(body)
+            self.status_bar.showMessage(f"Imported curl — {method} {parsed['url'][:60]}")
+        else:
+            self.body_text.setPlainText("")
+            self.status_bar.showMessage(f"Imported curl — {method} {parsed['url'][:60]}")
+
+        self._update_method_color()
+        return True
+
     def send_request(self):
+        if looks_like_curl(self.url_input.text()):
+            if not self.import_curl(self.url_input.text()):
+                QMessageBox.warning(
+                    self,
+                    "Invalid cURL",
+                    "That looks like a cURL command, but CurlPro couldn't find a URL in it.",
+                )
+                return
+
         env_name = self.env_combo.currentText()
         env = self.envs.get(env_name, {})
 
