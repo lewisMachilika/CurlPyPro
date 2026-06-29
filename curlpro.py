@@ -752,18 +752,28 @@ class CurlProMainWindow(QMainWindow):
         url_layout = QHBoxLayout()
         self.method_combo = QComboBox()
         self.method_combo.addItems(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
-        self.method_combo.setFixedWidth(100)
+        self.method_combo.setFixedWidth(110)
+        self.method_combo.setFixedHeight(36)
+        self.method_combo.setToolTip("HTTP method")
+        # Color the method so the request type is obvious at a glance.
+        self.method_combo.currentTextChanged.connect(self._update_method_color)
 
         self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText("Enter request URL e.g. https://api.example.com/v1/items")
+        self.url_input.setPlaceholderText("Enter request URL e.g. https://api.example.com/v1/items   —   press Enter to send")
+        self.url_input.setClearButtonEnabled(True)
+        self.url_input.setMinimumHeight(36)
         font = self.url_input.font()
         font.setPointSize(11)
         self.url_input.setFont(font)
+        # Pressing Enter anywhere in the URL bar fires the request — the single
+        # most expected interaction in a tool like this.
+        self.url_input.returnPressed.connect(self.send_request)
 
         self.send_btn = QPushButton("Send")
         self.send_btn.setObjectName("send_btn")
         self.send_btn.setFixedWidth(100)
         self.send_btn.setFixedHeight(36)
+        self.send_btn.setToolTip("Send request  (Ctrl+Enter / F5)")
         self.send_btn.clicked.connect(self.send_request)
 
         save_menu = QMenu()
@@ -775,9 +785,11 @@ class CurlProMainWindow(QMainWindow):
         self.save_btn.setMenu(save_menu)
         self.save_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
         self.save_btn.setFixedHeight(36)
+        self.save_btn.setToolTip("Save this request to a collection or file  (Ctrl+S)")
 
         load_btn = QPushButton("Load")
         load_btn.setFixedHeight(36)
+        load_btn.setToolTip("Load a saved request from a .json file")
         load_btn.clicked.connect(self.load_request_file)
 
         # Generate menu (snippets)
