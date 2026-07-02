@@ -5,13 +5,18 @@ A lightweight Postman-style API client built with **PyQt6** (GUI) and **requests
 Features:
 
 - Request builder (method, URL)
+- Query-parameter editor with enable/disable rows and URL extraction
 - Headers editor (simple `Key: Value` lines)
 - Body editor (raw text / JSON)
-- Environment variables with `{{VAR}}` substitution (URL, headers, body)
-- Send button with response viewer (status, headers, pretty JSON body)
+- Auth helpers for bearer tokens, basic auth, and API keys
+- Advanced transport controls for redirects, SSL verification, timeouts, and retries
+- Environment variables with `{{VAR}}` substitution (URL, params, headers, auth, body)
+- Send button with response viewer (status, headers, pretty JSON body, image preview, response insights)
 - History + saving/loading requests (collections stored locally)
-- Code-snippet generation (curl, python requests, PowerShell, axios)
+- Code-snippet generation (curl, python requests, PowerShell, Java, axios)
 - File/image attachments via `multipart/form-data`
+- Stress testing with concurrency, status/latency summaries, and optional pre-request scripts
+- Raw response saving, base64 extraction, and HAR export
 
 On first run the app creates `~/.curlpro/` storing history, envs, and collections.
 

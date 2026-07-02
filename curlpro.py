@@ -15,11 +15,17 @@ import time
 import re
 import sqlite3
 import mimetypes
+import datetime as _dt
 from pathlib import Path
 import shlex
 import base64
-from urllib.parse import unquote, urlparse, urlencode
+from urllib.parse import unquote, urlparse, urlencode, parse_qsl, urlunparse
 import requests
+from requests.adapters import HTTPAdapter
+try:
+    from urllib3.util import Retry
+except Exception:  # pragma: no cover - depends on requests' vendored stack
+    Retry = None
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit, QComboBox, QListWidget,
@@ -27,7 +33,8 @@ from PyQt6.QtWidgets import (
     QInputDialog, QTreeWidget, QTreeWidgetItem, QFrame, QScrollArea,
     QGroupBox, QDialog, QDialogButtonBox, QProgressBar, QStatusBar,
     QToolButton, QMenu, QPlainTextEdit, QStackedWidget,
-    QTableWidget, QTableWidgetItem, QHeaderView, QSpinBox, QWidgetAction
+    QTableWidget, QTableWidgetItem, QHeaderView, QSpinBox, QDoubleSpinBox,
+    QCheckBox, QWidgetAction
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QClipboard, QColor, QShortcut, QKeySequence, QFont, QPixmap
@@ -222,6 +229,70 @@ def apply_env(text: str, env: dict):
     return placeholder_pattern.sub(repl, text)
 
 
+def parse_status_code_list(text: str):
+    """Parse comma/space separated retry status codes into a sorted list."""
+    codes = set()
+    for part in re.split(r"[\s,]+", text or ""):
+        if not part:
+            continue
+        try:
+            code = int(part)
+        except ValueError:
+            continue
+        if 100 <= code <= 599:
+            codes.add(code)
+    return sorted(codes)
+
+
+def add_params_to_url(url: str, params) -> str:
+    """Append resolved query params to a URL while preserving any existing query."""
+    if not params:
+        return url
+    parsed = urlparse(url)
+    existing = parse_qsl(parsed.query, keep_blank_values=True)
+    if isinstance(params, dict):
+        param_items = list(params.items())
+    else:
+        param_items = list(params)
+    merged = existing + [(str(k), str(v)) for k, v in param_items]
+    return urlunparse(parsed._replace(query=urlencode(merged, doseq=True)))
+
+
+def strip_query_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    return urlunparse(parsed._replace(query=""))
+
+
+def make_retry_session(retry_total=0, retry_backoff=0.0, retry_statuses=None, max_redirects=30):
+    """Return a requests session configured with optional urllib3 retries."""
+    session = requests.Session()
+    try:
+        session.max_redirects = max(1, int(max_redirects or 30))
+    except Exception:
+        session.max_redirects = 30
+
+    retry_total = int(retry_total or 0)
+    if retry_total > 0 and Retry is not None:
+        retry_kwargs = {
+            "total": retry_total,
+            "connect": retry_total,
+            "read": retry_total,
+            "status": retry_total,
+            "backoff_factor": float(retry_backoff or 0),
+            "status_forcelist": retry_statuses or [429, 500, 502, 503, 504],
+            "raise_on_status": False,
+            "respect_retry_after_header": True,
+        }
+        try:
+            retry = Retry(allowed_methods=None, **retry_kwargs)
+        except TypeError:
+            retry = Retry(method_whitelist=None, **retry_kwargs)
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+    return session
+
+
 # ---------------------------
 # curl command parsing
 # ---------------------------
@@ -337,7 +408,12 @@ class RequestThread(QThread):
     finished = pyqtSignal(object)
     error = pyqtSignal(str)
 
-    def __init__(self, method, url, headers, json_body, data, files=None, timeout=30, params=None, auth=None):
+    def __init__(
+        self, method, url, headers, json_body, data, files=None, timeout=30,
+        params=None, auth=None, allow_redirects=True, verify_ssl=True,
+        max_redirects=30, retry_total=0, retry_backoff=0.0,
+        retry_statuses=None,
+    ):
         super().__init__()
         self.method = method
         self.url = url
@@ -348,6 +424,12 @@ class RequestThread(QThread):
         self.timeout = timeout
         self.params = params or None  # dict of query params (used by API-key auth)
         self.auth = auth              # (username, password) tuple for Basic auth, or None
+        self.allow_redirects = allow_redirects
+        self.verify_ssl = verify_ssl
+        self.max_redirects = max_redirects
+        self.retry_total = retry_total
+        self.retry_backoff = retry_backoff
+        self.retry_statuses = retry_statuses or []
 
     # def run(self):
     #     try:
@@ -369,9 +451,14 @@ class RequestThread(QThread):
     #         self.error.emit(str(e))
 
     def run(self):
+        session = None
         try:
+            session = make_retry_session(
+                self.retry_total, self.retry_backoff,
+                self.retry_statuses, self.max_redirects
+            )
             t0 = time.time()
-            resp = requests.request(
+            resp = session.request(
                 self.method, self.url,
                 headers=self.headers,
                 json=self.json_body,
@@ -379,6 +466,8 @@ class RequestThread(QThread):
                 files=self.files,          # multipart support
                 params=self.params,        # query-param auth support
                 auth=self.auth,            # HTTP Basic auth support
+                allow_redirects=self.allow_redirects,
+                verify=self.verify_ssl,
                 timeout=self.timeout
             )
             elapsed = time.time() - t0
@@ -389,6 +478,11 @@ class RequestThread(QThread):
         except Exception as e:
             self.error.emit(str(e))
         finally:
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
             # Ensure any file objects passed in `files` are closed
             try:
                 if self.files:
@@ -510,19 +604,34 @@ class StressTestWorker(QThread):
                 data = overrides['data']
             if 'params' in overrides:
                 params = overrides['params']
+        session = None
         try:
-            resp = requests.request(
+            session = make_retry_session(
+                cfg.get('retry_total', 0),
+                cfg.get('retry_backoff', 0.0),
+                cfg.get('retry_statuses') or [],
+                cfg.get('max_redirects', 30),
+            )
+            resp = session.request(
                 cfg['method'], cfg['url'],
                 headers=headers,
                 json=json_body,
                 data=data,
                 params=params,
                 auth=cfg.get('auth'),
+                allow_redirects=cfg.get('allow_redirects', True),
+                verify=cfg.get('verify_ssl', True),
                 timeout=cfg.get('timeout', 30),
             )
             return {'status': resp.status_code, 'elapsed': (time.time() - t0) * 1000, 'error': None}
         except Exception as e:
             return {'status': 0, 'elapsed': (time.time() - t0) * 1000, 'error': str(e)}
+        finally:
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
 
     def _call_before_request(self):
         fn = self._script_fns.get('before_request')
@@ -1267,7 +1376,13 @@ class CurlProMainWindow(QMainWindow):
             "theme": "light",
             "font_size": 10,
             "auto_format_json": True,
-            "request_timeout": 30
+            "request_timeout": 30,
+            "follow_redirects": True,
+            "verify_ssl": True,
+            "max_redirects": 30,
+            "retry_total": 0,
+            "retry_backoff": 0.25,
+            "retry_statuses": "429,500,502,503,504",
         })
         self.history = load_history()
         self.envs = load_document("envs", {"default": {}})
@@ -1515,6 +1630,9 @@ class CurlProMainWindow(QMainWindow):
         # Tabs
         self.request_tabs = QTabWidget()
 
+        # Query params tab
+        self.request_tabs.addTab(self.create_params_tab(), "Params")
+
         # Headers tab
         headers_widget = QWidget()
         headers_layout = QVBoxLayout(headers_widget)
@@ -1578,6 +1696,9 @@ class CurlProMainWindow(QMainWindow):
         # Auth tab
         self.request_tabs.addTab(self.create_auth_tab(), "Auth")
 
+        # Advanced transport tab
+        self.request_tabs.addTab(self.create_advanced_tab(), "Advanced")
+
         request_layout.addWidget(self.request_tabs)
         right_layout.addWidget(request_group, 1)
 
@@ -1628,13 +1749,17 @@ class CurlProMainWindow(QMainWindow):
         self.response_headers.setReadOnly(True)
         self.response_tabs.addTab(self.response_headers, "Headers")
 
+        self.response_insights = QTextEdit()
+        self.response_insights.setReadOnly(True)
+        self.response_tabs.addTab(self.response_insights, "Insights")
+
         self.response_preview_label = QLabel("No preview available")
         self.response_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.response_preview_label.setMinimumSize(100, 100)
-        preview_scroll = QScrollArea()
-        preview_scroll.setWidget(self.response_preview_label)
-        preview_scroll.setWidgetResizable(True)
-        self.response_tabs.addTab(preview_scroll, "Preview")
+        self.response_preview_scroll = QScrollArea()
+        self.response_preview_scroll.setWidget(self.response_preview_label)
+        self.response_preview_scroll.setWidgetResizable(True)
+        self.response_tabs.addTab(self.response_preview_scroll, "Preview")
 
         response_layout.addWidget(self.response_tabs)
         # Download toolbar
@@ -1647,14 +1772,225 @@ class CurlProMainWindow(QMainWindow):
         self.btn_extract_base64.setToolTip("Parse JSON/Raw for base64 or data: URLs and save the decoded file.")
         self.btn_extract_base64.clicked.connect(self._extract_and_save_base64)
 
+        self.btn_export_har = QPushButton("Export HAR")
+        self.btn_export_har.setToolTip("Export the last request/response as an HTTP Archive file.")
+        self.btn_export_har.clicked.connect(self._export_response_har)
+
         download_toolbar.addWidget(self.btn_save_response_bytes)
         download_toolbar.addWidget(self.btn_extract_base64)
+        download_toolbar.addWidget(self.btn_export_har)
         download_toolbar.addStretch()
         response_layout.addLayout(download_toolbar)
 
         right_layout.addWidget(response_group, 1)
 
         return right_widget
+
+    # ---------- Params ----------
+    def create_params_tab(self):
+        params_widget = QWidget()
+        layout = QVBoxLayout(params_widget)
+
+        toolbar = QHBoxLayout()
+        btn_add = QPushButton("Add")
+        btn_remove = QPushButton("Remove")
+        btn_extract = QPushButton("Extract from URL")
+        btn_clear = QPushButton("Clear")
+        for btn in (btn_add, btn_remove, btn_extract, btn_clear):
+            btn.setFixedHeight(32)
+        btn_add.clicked.connect(lambda: self._add_param_row())
+        btn_remove.clicked.connect(self._remove_selected_param_rows)
+        btn_extract.clicked.connect(self._extract_params_from_url)
+        btn_clear.clicked.connect(self._clear_params)
+
+        toolbar.addWidget(btn_add)
+        toolbar.addWidget(btn_remove)
+        toolbar.addWidget(btn_extract)
+        toolbar.addWidget(btn_clear)
+        toolbar.addStretch()
+        layout.addLayout(toolbar)
+
+        self.params_table = QTableWidget(0, 3)
+        self.params_table.setHorizontalHeaderLabels(["On", "Key", "Value"])
+        hdr = self.params_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.params_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.params_table.setAlternatingRowColors(True)
+        layout.addWidget(self.params_table)
+
+        return params_widget
+
+    def _add_param_row(self, key="", value="", enabled=True):
+        row = self.params_table.rowCount()
+        self.params_table.insertRow(row)
+
+        enabled_item = QTableWidgetItem("")
+        enabled_item.setFlags(
+            Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsUserCheckable
+            | Qt.ItemFlag.ItemIsSelectable
+        )
+        enabled_item.setCheckState(Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked)
+        enabled_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.params_table.setItem(row, 0, enabled_item)
+
+        key_item = QTableWidgetItem(key)
+        value_item = QTableWidgetItem(value)
+        self.params_table.setItem(row, 1, key_item)
+        self.params_table.setItem(row, 2, value_item)
+        self.params_table.setCurrentCell(row, 1)
+
+    def _remove_selected_param_rows(self):
+        rows = sorted({idx.row() for idx in self.params_table.selectedIndexes()}, reverse=True)
+        if not rows:
+            return
+        for row in rows:
+            self.params_table.removeRow(row)
+
+    def _clear_params(self):
+        self.params_table.setRowCount(0)
+
+    def _extract_params_from_url(self):
+        url = self.url_input.text().strip()
+        parsed = urlparse(url)
+        pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        if not pairs:
+            self.status_bar.showMessage("No query parameters found in URL")
+            return
+        for key, value in pairs:
+            self._add_param_row(key, value, True)
+        self.url_input.setText(strip_query_from_url(url))
+        self.status_bar.showMessage(f"Extracted {len(pairs)} query parameter{'s' if len(pairs) != 1 else ''}")
+
+    def _params_snapshot(self):
+        rows = []
+        if not hasattr(self, "params_table"):
+            return rows
+        for row in range(self.params_table.rowCount()):
+            enabled_item = self.params_table.item(row, 0)
+            key_item = self.params_table.item(row, 1)
+            value_item = self.params_table.item(row, 2)
+            rows.append({
+                "enabled": enabled_item.checkState() == Qt.CheckState.Checked if enabled_item else True,
+                "key": key_item.text() if key_item else "",
+                "value": value_item.text() if value_item else "",
+            })
+        return rows
+
+    def _restore_params(self, rows):
+        self._clear_params()
+        if isinstance(rows, dict):
+            rows = [{"enabled": True, "key": k, "value": v} for k, v in rows.items()]
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            self._add_param_row(
+                str(row.get("key", "")),
+                str(row.get("value", "")),
+                bool(row.get("enabled", True)),
+            )
+
+    def _resolved_params(self, env: dict):
+        params = []
+        for row in self._params_snapshot():
+            if not row.get("enabled", True):
+                continue
+            key = apply_env((row.get("key") or "").strip(), env)
+            if not key:
+                continue
+            params.append((key, apply_env(row.get("value") or "", env)))
+        return params
+
+    # ---------- Advanced transport ----------
+    def create_advanced_tab(self):
+        advanced_widget = QWidget()
+        layout = QVBoxLayout(advanced_widget)
+
+        transport_group = QGroupBox("Transport")
+        transport_layout = QVBoxLayout(transport_group)
+
+        self.follow_redirects_check = QCheckBox("Follow redirects")
+        self.follow_redirects_check.setChecked(bool(self.settings.get("follow_redirects", True)))
+        self.verify_ssl_check = QCheckBox("Verify SSL certificates")
+        self.verify_ssl_check.setChecked(bool(self.settings.get("verify_ssl", True)))
+
+        max_redirects_row = QHBoxLayout()
+        max_redirects_row.addWidget(QLabel("Max redirects:"))
+        self.max_redirects_spin = QSpinBox()
+        self.max_redirects_spin.setRange(1, 100)
+        self.max_redirects_spin.setValue(int(self.settings.get("max_redirects", 30)))
+        self.max_redirects_spin.setFixedWidth(90)
+        max_redirects_row.addWidget(self.max_redirects_spin)
+        max_redirects_row.addStretch()
+
+        transport_layout.addWidget(self.follow_redirects_check)
+        transport_layout.addWidget(self.verify_ssl_check)
+        transport_layout.addLayout(max_redirects_row)
+        layout.addWidget(transport_group)
+
+        retry_group = QGroupBox("Retries")
+        retry_layout = QVBoxLayout(retry_group)
+
+        retry_row = QHBoxLayout()
+        retry_row.addWidget(QLabel("Retry attempts:"))
+        self.retry_total_spin = QSpinBox()
+        self.retry_total_spin.setRange(0, 10)
+        self.retry_total_spin.setValue(int(self.settings.get("retry_total", 0)))
+        self.retry_total_spin.setFixedWidth(90)
+        retry_row.addWidget(self.retry_total_spin)
+        retry_row.addSpacing(18)
+        retry_row.addWidget(QLabel("Backoff:"))
+        self.retry_backoff_spin = QDoubleSpinBox()
+        self.retry_backoff_spin.setRange(0.0, 60.0)
+        self.retry_backoff_spin.setDecimals(2)
+        self.retry_backoff_spin.setSingleStep(0.25)
+        self.retry_backoff_spin.setSuffix(" s")
+        self.retry_backoff_spin.setValue(float(self.settings.get("retry_backoff", 0.25)))
+        self.retry_backoff_spin.setFixedWidth(110)
+        retry_row.addWidget(self.retry_backoff_spin)
+        retry_row.addStretch()
+        retry_layout.addLayout(retry_row)
+
+        statuses_row = QHBoxLayout()
+        statuses_row.addWidget(QLabel("Retry status codes:"))
+        self.retry_statuses_input = QLineEdit()
+        self.retry_statuses_input.setPlaceholderText("429,500,502,503,504")
+        self.retry_statuses_input.setText(str(self.settings.get("retry_statuses", "429,500,502,503,504")))
+        statuses_row.addWidget(self.retry_statuses_input)
+        retry_layout.addLayout(statuses_row)
+
+        layout.addWidget(retry_group)
+        layout.addStretch()
+        return advanced_widget
+
+    def _advanced_snapshot(self):
+        if not hasattr(self, "follow_redirects_check"):
+            return {}
+        return {
+            "follow_redirects": self.follow_redirects_check.isChecked(),
+            "verify_ssl": self.verify_ssl_check.isChecked(),
+            "max_redirects": self.max_redirects_spin.value(),
+            "retry_total": self.retry_total_spin.value(),
+            "retry_backoff": self.retry_backoff_spin.value(),
+            "retry_statuses": self.retry_statuses_input.text().strip(),
+        }
+
+    def _restore_advanced(self, cfg):
+        cfg = cfg or {}
+        if "follow_redirects" in cfg:
+            self.follow_redirects_check.setChecked(bool(cfg.get("follow_redirects")))
+        if "verify_ssl" in cfg:
+            self.verify_ssl_check.setChecked(bool(cfg.get("verify_ssl")))
+        if "max_redirects" in cfg:
+            self.max_redirects_spin.setValue(int(cfg.get("max_redirects") or 30))
+        if "retry_total" in cfg:
+            self.retry_total_spin.setValue(int(cfg.get("retry_total") or 0))
+        if "retry_backoff" in cfg:
+            self.retry_backoff_spin.setValue(float(cfg.get("retry_backoff") or 0))
+        if "retry_statuses" in cfg:
+            self.retry_statuses_input.setText(str(cfg.get("retry_statuses") or ""))
 
     # ---------- Auth ----------
     def create_auth_tab(self):
@@ -1789,7 +2125,10 @@ class CurlProMainWindow(QMainWindow):
             value = apply_env(cfg.get("value", ""), env)
             if key:
                 if cfg.get("add_to") == "Query Params":
-                    params[key] = value
+                    if hasattr(params, "append"):
+                        params.append((key, value))
+                    else:
+                        params[key] = value
                 else:
                     headers[key] = value
         return None
@@ -1873,6 +2212,236 @@ class CurlProMainWindow(QMainWindow):
             QMessageBox.information(self, "Saved", f"Saved decoded file ({len(data_bytes):,} bytes) to:\n{fname}")
         except Exception as e:
             QMessageBox.critical(self, "Save Error", str(e))
+
+    def _export_response_har(self):
+        if not self._last_response:
+            QMessageBox.information(self, "No Response", "Send a request first.")
+            return
+
+        parsed = urlparse(getattr(self._last_response, "url", "") or self.url_input.text().strip())
+        host = (parsed.netloc or "request").replace(":", "_")
+        suggested = f"curlpro-{host}-{time.strftime('%Y%m%d-%H%M%S')}.har"
+        fname, _ = QFileDialog.getSaveFileName(
+            self, "Export HAR", str(Path.home() / suggested), "HAR Files (*.har);;JSON Files (*.json)"
+        )
+        if not fname:
+            return
+        try:
+            har = self._response_to_har(self._last_response)
+            Path(fname).write_text(json.dumps(har, indent=2), encoding="utf-8")
+            QMessageBox.information(self, "Exported", f"HAR exported to:\n{fname}")
+        except Exception as e:
+            QMessageBox.critical(self, "HAR Export Error", str(e))
+
+    def _response_to_har(self, response):
+        chain = list(getattr(response, "history", []) or []) + [response]
+        return {
+            "log": {
+                "version": "1.2",
+                "creator": {"name": "CurlPro", "version": "1.0"},
+                "pages": [],
+                "entries": [self._har_entry_for_response(resp) for resp in chain],
+            }
+        }
+
+    def _har_entry_for_response(self, response):
+        req = getattr(response, "request", None)
+        req_url = getattr(req, "url", None) or getattr(response, "url", "")
+        parsed = urlparse(req_url)
+        req_headers = dict(getattr(req, "headers", {}) or {})
+        resp_headers = dict(getattr(response, "headers", {}) or {})
+        elapsed_ms = 0
+        try:
+            elapsed_ms = max(0, int(response.elapsed.total_seconds() * 1000))
+        except Exception:
+            pass
+
+        started = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(milliseconds=elapsed_ms)
+        started_text = started.isoformat().replace("+00:00", "Z")
+
+        request_body = getattr(req, "body", None)
+        post_data = None
+        body_size = 0
+        if request_body is not None:
+            if isinstance(request_body, str):
+                body_bytes = request_body.encode("utf-8")
+                body_text = request_body
+                body_encoding = None
+            elif isinstance(request_body, bytes):
+                body_bytes = request_body
+                body_text, body_encoding = self._har_text_from_bytes(
+                    body_bytes, req_headers.get("Content-Type", "")
+                )
+            else:
+                try:
+                    body_bytes = bytes(request_body)
+                except Exception:
+                    body_bytes = str(request_body).encode("utf-8")
+                body_text, body_encoding = self._har_text_from_bytes(
+                    body_bytes, req_headers.get("Content-Type", "")
+                )
+            body_size = len(body_bytes)
+            post_data = {
+                "mimeType": req_headers.get("Content-Type", ""),
+                "text": body_text,
+            }
+            if body_encoding:
+                post_data["encoding"] = body_encoding
+
+        resp_body = getattr(response, "content", b"") or b""
+        content_type = resp_headers.get("Content-Type", "")
+        content_text, content_encoding = self._har_text_from_bytes(resp_body, content_type)
+        content = {
+            "size": len(resp_body),
+            "mimeType": content_type,
+            "text": content_text,
+        }
+        if content_encoding:
+            content["encoding"] = content_encoding
+
+        request_obj = {
+            "method": getattr(req, "method", "GET"),
+            "url": req_url,
+            "httpVersion": "HTTP/1.1",
+            "cookies": [],
+            "headers": [{"name": k, "value": str(v)} for k, v in req_headers.items()],
+            "queryString": [
+                {"name": k, "value": v}
+                for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+            ],
+            "headersSize": -1,
+            "bodySize": body_size,
+        }
+        if post_data is not None:
+            request_obj["postData"] = post_data
+
+        return {
+            "startedDateTime": started_text,
+            "time": elapsed_ms,
+            "request": request_obj,
+            "response": {
+                "status": getattr(response, "status_code", 0),
+                "statusText": getattr(response, "reason", ""),
+                "httpVersion": "HTTP/1.1",
+                "cookies": [],
+                "headers": [{"name": k, "value": str(v)} for k, v in resp_headers.items()],
+                "content": content,
+                "redirectURL": resp_headers.get("Location", ""),
+                "headersSize": -1,
+                "bodySize": len(resp_body),
+            },
+            "cache": {},
+            "timings": {
+                "blocked": -1,
+                "dns": -1,
+                "connect": -1,
+                "send": 0,
+                "wait": elapsed_ms,
+                "receive": 0,
+                "ssl": -1,
+            },
+        }
+
+    def _har_text_from_bytes(self, body: bytes, content_type: str):
+        if not body:
+            return "", None
+        if self._is_binary_content_type(content_type):
+            return base64.b64encode(body).decode("ascii"), "base64"
+        encoding = "utf-8"
+        try:
+            ct = content_type or ""
+            match = re.search(r"charset=([^;]+)", ct, flags=re.I)
+            if match:
+                encoding = match.group(1).strip()
+            return body.decode(encoding), None
+        except Exception:
+            return base64.b64encode(body).decode("ascii"), "base64"
+
+    def _build_response_insights(self, response, elapsed):
+        req = getattr(response, "request", None)
+        headers = response.headers
+        content_type = headers.get("Content-Type", "")
+        url = getattr(response, "url", "") or getattr(req, "url", "")
+        parsed = urlparse(url)
+        size = len(getattr(response, "content", b"") or b"")
+        elapsed_ms = elapsed * 1000 if elapsed is not None else 0
+
+        lines = [
+            "Summary",
+            f"  Method: {getattr(req, 'method', '')}",
+            f"  URL: {url}",
+            f"  Status: {response.status_code} {response.reason}",
+            f"  Time: {elapsed_ms:.0f} ms",
+            f"  Size: {size:,} bytes",
+            f"  Content-Type: {content_type or '(none)'}",
+            f"  Encoding: {response.encoding or '(none)'}",
+            "",
+            "Redirects",
+        ]
+
+        history = list(getattr(response, "history", []) or [])
+        if history:
+            for i, hop in enumerate(history, 1):
+                loc = hop.headers.get("Location", "")
+                lines.append(f"  {i}. {hop.status_code} {hop.reason} -> {loc or hop.url}")
+            lines.append(f"  Final: {response.status_code} {url}")
+        else:
+            lines.append("  None")
+
+        lines += ["", "Security"]
+        security_headers = [
+            "Strict-Transport-Security",
+            "Content-Security-Policy",
+            "X-Frame-Options",
+            "X-Content-Type-Options",
+            "Referrer-Policy",
+            "Permissions-Policy",
+        ]
+        missing = []
+        for name in security_headers:
+            value = headers.get(name)
+            if value:
+                lines.append(f"  {name}: {value}")
+            else:
+                missing.append(name)
+        if parsed.scheme == "https" and missing:
+            lines.append("  Missing common headers: " + ", ".join(missing))
+
+        cors = headers.get("Access-Control-Allow-Origin")
+        if cors:
+            lines.append(f"  CORS allow-origin: {cors}")
+
+        lines += ["", "Cookies"]
+        set_cookie = headers.get("Set-Cookie")
+        if set_cookie:
+            cookie_lower = set_cookie.lower()
+            flags = []
+            for flag in ("secure", "httponly", "samesite"):
+                flags.append(f"{flag}={'yes' if flag in cookie_lower else 'no'}")
+            lines.append("  Set-Cookie present (" + ", ".join(flags) + ")")
+        else:
+            lines.append("  No Set-Cookie header")
+
+        lines += ["", "Cache"]
+        cache_headers = ["Cache-Control", "ETag", "Last-Modified", "Expires", "Age", "Vary"]
+        wrote_cache = False
+        for name in cache_headers:
+            value = headers.get(name)
+            if value:
+                lines.append(f"  {name}: {value}")
+                wrote_cache = True
+        if not wrote_cache:
+            lines.append("  No explicit cache headers")
+
+        lines += ["", "Server"]
+        for name in ("Server", "Date", "Via", "X-Request-ID", "X-Correlation-ID"):
+            value = headers.get(name)
+            if value:
+                lines.append(f"  {name}: {value}")
+        if not any(headers.get(name) for name in ("Server", "Date", "Via", "X-Request-ID", "X-Correlation-ID")):
+            lines.append("  No common server metadata headers")
+
+        return "\n".join(lines)
 
     def init_status_bar(self):
         self.status_bar = QStatusBar()
@@ -2103,6 +2672,7 @@ class CurlProMainWindow(QMainWindow):
         self.response_headers.setPlainText(
             "\n".join(f"{k}: {v}" for k, v in response.headers.items())
         )
+        self.response_insights.setPlainText(self._build_response_insights(response, elapsed))
         raw_text = response.text
         self.response_raw.setPlainText(raw_text)
 
@@ -2119,10 +2689,12 @@ class CurlProMainWindow(QMainWindow):
                 scaled = pixmap.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatio,
                                        Qt.TransformationMode.SmoothTransformation)
                 self.response_preview_label.setPixmap(scaled)
-                self.response_tabs.setCurrentIndex(3)
+                self.response_tabs.setCurrentWidget(self.response_preview_scroll)
             else:
+                self.response_preview_label.clear()
                 self.response_preview_label.setText("Could not decode image")
         else:
+            self.response_preview_label.clear()
             self.response_preview_label.setText("No preview available")
 
         if self._is_binary_content_type(content_type) and not any(x in content_type for x in image_types):
@@ -2353,7 +2925,19 @@ class CurlProMainWindow(QMainWindow):
         valid_methods = [self.method_combo.itemText(i) for i in range(self.method_combo.count())]
         self.method_combo.setCurrentText(method if method in valid_methods else "GET")
 
-        self.url_input.setText(parsed["url"])
+        self._clear_params()
+        url_query_pairs = parse_qsl(urlparse(parsed["url"]).query, keep_blank_values=True)
+        imported_param_count = len(url_query_pairs)
+        if url_query_pairs:
+            self.url_input.setText(strip_query_from_url(parsed["url"]))
+            for key, value in url_query_pairs:
+                self._add_param_row(key, value, True)
+        else:
+            self.url_input.setText(parsed["url"])
+        if parsed["get_with_data"] and parsed["data"]:
+            for key, value in parse_qsl(parsed["data"], keep_blank_values=True):
+                self._add_param_row(key, value, True)
+                imported_param_count += 1
 
         # Lift recognised auth out of the headers into the Auth tab.
         auth_cfg = {"type": "No Auth"}
@@ -2382,7 +2966,7 @@ class CurlProMainWindow(QMainWindow):
             file_fields = [f for f in parsed["form"] if f not in text_fields]
             note = "  (file fields ignored — add them under Attachments)" if file_fields else ""
             self.status_bar.showMessage(f"Imported curl — {method} {parsed['url'][:60]}{note}")
-        elif parsed["data"]:
+        elif parsed["data"] and not parsed["get_with_data"]:
             body = parsed["data"]
             is_json = "application/json" in content_type or body.lstrip().startswith(("{", "["))
             if is_json:
@@ -2397,7 +2981,11 @@ class CurlProMainWindow(QMainWindow):
             self.status_bar.showMessage(f"Imported curl — {method} {parsed['url'][:60]}")
         else:
             self.body_text.setPlainText("")
-            self.status_bar.showMessage(f"Imported curl — {method} {parsed['url'][:60]}")
+            suffix = (
+                f" with {imported_param_count} param{'s' if imported_param_count != 1 else ''}"
+                if imported_param_count else ""
+            )
+            self.status_bar.showMessage(f"Imported curl — {method} {parsed['url'][:60]}{suffix}")
 
         self._update_method_color()
         return True
@@ -2482,18 +3070,21 @@ class CurlProMainWindow(QMainWindow):
             # Raw
             data = body_raw.encode("utf-8") if body_raw else None
 
-        # Apply authentication (mutates headers/params, returns Basic-auth tuple or None)
-        params = {}
+        # Apply query params and authentication (auth mutates headers/params).
+        params = self._resolved_params(env)
         auth_tuple = self.apply_auth(headers, params, env)
+        advanced = self._advanced_snapshot()
 
         # Snapshot current UI inputs so history is accurate if the user edits
         # the form while this request is in flight (multiple concurrent requests).
         snapshot = {
             'req_url': self.url_input.text(),
             'req_headers_text': self.headers_text.toPlainText(),
+            'params': self._params_snapshot(),
             'body_type': self.body_type_combo.currentText(),
             'request_body': self.body_text.toPlainText(),
             'auth': self.get_auth_config(),
+            'advanced': dict(advanced),
             'attachments': self._attachments_snapshot(),
         }
 
@@ -2504,7 +3095,13 @@ class CurlProMainWindow(QMainWindow):
         timeout = None if raw_timeout == 0 else raw_timeout
         thread = RequestThread(
             method, url, headers, json_body, data, files, timeout,
-            params=params or None, auth=auth_tuple
+            params=params or None, auth=auth_tuple,
+            allow_redirects=advanced.get("follow_redirects", True),
+            verify_ssl=advanced.get("verify_ssl", True),
+            max_redirects=advanced.get("max_redirects", 30),
+            retry_total=advanced.get("retry_total", 0),
+            retry_backoff=advanced.get("retry_backoff", 0.0),
+            retry_statuses=parse_status_code_list(advanced.get("retry_statuses", "")),
         )
         self._request_store[req_id] = {
             'thread': thread,
@@ -2556,8 +3153,10 @@ class CurlProMainWindow(QMainWindow):
                 "response_body_full": raw_text,
                 "req_url": snapshot.get('req_url', self.url_input.text()),
                 "req_headers_text": snapshot.get('req_headers_text', self.headers_text.toPlainText()),
+                "params": snapshot.get('params', self._params_snapshot()),
                 "body_type": snapshot.get('body_type', self.body_type_combo.currentText()),
                 "auth": snapshot.get('auth', self.get_auth_config()),
+                "advanced": snapshot.get('advanced', self._advanced_snapshot()),
                 "attachments": snapshot.get('attachments', self._attachments_snapshot()),
             }
             entry["_id"] = add_history(entry)
@@ -2610,8 +3209,10 @@ class CurlProMainWindow(QMainWindow):
                 "response_body_full": "",
                 "req_url": snapshot.get('req_url', self.url_input.text()),
                 "req_headers_text": snapshot.get('req_headers_text', self.headers_text.toPlainText()),
+                "params": snapshot.get('params', self._params_snapshot()),
                 "body_type": snapshot.get('body_type', self.body_type_combo.currentText()),
                 "auth": snapshot.get('auth', self.get_auth_config()),
+                "advanced": snapshot.get('advanced', self._advanced_snapshot()),
                 "attachments": snapshot.get('attachments', self._attachments_snapshot()),
             }
             entry["_id"] = add_history(entry)
@@ -2634,9 +3235,11 @@ class CurlProMainWindow(QMainWindow):
             "method": self.method_combo.currentText(),
             "url": self.url_input.text(),
             "headers": self.headers_text.toPlainText(),
+            "params": self._params_snapshot(),
             "body_type": self.body_type_combo.currentText(),
             "body": self.body_text.toPlainText(),
             "auth": self.get_auth_config(),
+            "advanced": self._advanced_snapshot(),
             "attachments": self._attachments_snapshot(),
         }
         coll.append(req)
@@ -2652,9 +3255,11 @@ class CurlProMainWindow(QMainWindow):
             "method": self.method_combo.currentText(),
             "url": self.url_input.text(),
             "headers": self.headers_text.toPlainText(),
+            "params": self._params_snapshot(),
             "body_type": self.body_type_combo.currentText(),
             "body": self.body_text.toPlainText(),
             "auth": self.get_auth_config(),
+            "advanced": self._advanced_snapshot(),
             "attachments": self._attachments_snapshot(),
         }
         try:
@@ -2672,10 +3277,12 @@ class CurlProMainWindow(QMainWindow):
             self.method_combo.setCurrentText(data.get("method", "GET"))
             self.url_input.setText(data.get("url", ""))
             self.headers_text.setPlainText(data.get("headers", ""))
+            self._restore_params(data.get("params", []))
             self.body_type_combo.setCurrentText(data.get("body_type", "Raw"))
             self.body_text.setPlainText(data.get("body", ""))
             self.restore_attachments(data.get("attachments", []))
             self.set_auth_config(data.get("auth", {}))
+            self._restore_advanced(data.get("advanced", {}))
             QMessageBox.information(self, "Loaded", f"Request loaded from {fname}")
         except Exception as e:
             QMessageBox.critical(self, "Load Error", str(e))
@@ -2712,10 +3319,12 @@ class CurlProMainWindow(QMainWindow):
                 self.method_combo.setCurrentText(req.get("method", "GET"))
                 self.url_input.setText(req.get("url", ""))
                 self.headers_text.setPlainText(req.get("headers", ""))
+                self._restore_params(req.get("params", []))
                 self.body_type_combo.setCurrentText(req.get("body_type", "Raw"))
                 self.body_text.setPlainText(req.get("body", ""))
                 self.restore_attachments(req.get("attachments", []))
                 self.set_auth_config(req.get("auth", {}))
+                self._restore_advanced(req.get("advanced", {}))
                 QMessageBox.information(self, "Loaded", f"Loaded request from collection '{coll}'")
             except Exception as e:
                 QMessageBox.critical(self, "Load Error", str(e))
@@ -2741,6 +3350,8 @@ class CurlProMainWindow(QMainWindow):
         else:
             self.headers_text.clear()
 
+        self._restore_params(data.get("params", []))
+
         # Restore body type before body so the right placeholder/attachments show
         if data.get("body_type"):
             self.body_type_combo.setCurrentText(data.get("body_type"))
@@ -2752,6 +3363,8 @@ class CurlProMainWindow(QMainWindow):
         # Restore auth configuration
         if "auth" in data:
             self.set_auth_config(data.get("auth", {}))
+        if "advanced" in data:
+            self._restore_advanced(data.get("advanced", {}))
 
         self.status_bar.showMessage(f"Loaded from history: {data.get('method', '')} {data.get('url', '')}")
 
@@ -2936,16 +3549,15 @@ class CurlProMainWindow(QMainWindow):
                 headers[key.strip()] = apply_env(value.strip(), env)
         body_raw = apply_env(self.body_text.toPlainText().strip(), env)
 
-        # Fold authentication into the snippet's headers / URL query string
-        params = {}
+        # Fold query params and authentication into the snippet's URL/headers.
+        params = self._resolved_params(env)
         auth_tuple = self.apply_auth(headers, params, env)
         if auth_tuple:
             user, pwd = auth_tuple
             token = base64.b64encode(f"{user}:{pwd}".encode("utf-8")).decode("ascii")
             headers["Authorization"] = f"Basic {token}"
         if params:
-            sep = "&" if "?" in url else "?"
-            url = url + sep + urlencode(params)
+            url = add_params_to_url(url, params)
 
         attachments = list(self.file_attachments) if hasattr(self, "file_attachments") else []
         return method, url, headers, body_raw, attachments
@@ -3421,8 +4033,9 @@ class CurlProMainWindow(QMainWindow):
         elif body_raw:
             data = body_raw.encode("utf-8")
 
-        params = {}
+        params = self._resolved_params(env)
         auth_tuple = self.apply_auth(headers, params, env)
+        advanced = self._advanced_snapshot()
 
         config = {
             'method': self.method_combo.currentText(),
@@ -3433,6 +4046,12 @@ class CurlProMainWindow(QMainWindow):
             'params': params or None,
             'auth': auth_tuple,
             'timeout': None if self.timeout_spin.value() == 0 else self.timeout_spin.value(),
+            'allow_redirects': advanced.get("follow_redirects", True),
+            'verify_ssl': advanced.get("verify_ssl", True),
+            'max_redirects': advanced.get("max_redirects", 30),
+            'retry_total': advanced.get("retry_total", 0),
+            'retry_backoff': advanced.get("retry_backoff", 0.0),
+            'retry_statuses': parse_status_code_list(advanced.get("retry_statuses", "")),
         }
 
         dlg = StressTestDialog(config, self)
@@ -3443,6 +4062,8 @@ class CurlProMainWindow(QMainWindow):
         try:
             # History is persisted incrementally as requests run; only the
             # wholesale documents need flushing here.
+            self.settings["request_timeout"] = self.timeout_spin.value()
+            self.settings.update(self._advanced_snapshot())
             save_document("settings", self.settings)
             save_document("envs", self.envs)
             save_document("collections", self.collections)
