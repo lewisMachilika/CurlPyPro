@@ -231,51 +231,120 @@ _CURL_NOARG_FLAGS = {
     "-L", "--location", "-v", "--verbose", "-f", "--fail", "--compressed",
     "-#", "--progress-bar", "-g", "--globoff", "-N", "--no-buffer", "-#",
     "-O", "--remote-name", "-j", "--junk-session-cookies", "--raw",
+    "-J", "--remote-header-name",
 }
+
+_CURL_COMMAND_RE = re.compile(r"^\s*curl(?:\.exe)?(?=$|\s)", re.IGNORECASE)
 
 
 def looks_like_curl(text: str) -> bool:
     """True if `text` looks like a pasted curl command (vs. a plain URL)."""
-    s = (text or "").strip().lower()
-    return s.startswith("curl ") or s.startswith("curl\n") or s == "curl" or s.startswith("curl\t")
+    return bool(_CURL_COMMAND_RE.match(text or ""))
+
+
+def _strip_curl_command(text: str) -> str:
+    """Remove a leading curl/curl.exe command word from a pasted command."""
+    return _CURL_COMMAND_RE.sub("", text or "", count=1).lstrip()
+
+
+def _normalise_curl_continuations(text: str) -> str:
+    """Collapse common shell line continuations before tokenising.
+
+    Supports Unix backslash, PowerShell backtick, and Windows cmd.exe caret.
+    Single-line widgets may flatten newlines before paste handlers see them, so
+    also handle a dangling continuation marker followed by a likely next flag.
+    """
+    text = re.sub(r"\\[ \t]*\r?\n", " ", text)
+    text = re.sub(r"`[ \t]*\r?\n", " ", text)
+    text = re.sub(r"\^[ \t]*\r?\n", " ", text)
+    next_token = r"(?=(?:-{1,2}[A-Za-z]|https?://))"
+    text = re.sub(r"\\\s+" + next_token, " ", text)
+    text = re.sub(r"`\s+" + next_token, " ", text)
+    text = re.sub(r"\^\s+" + next_token, " ", text)
+    return text
+
+
+def _split_curl_tokens(text: str) -> list:
+    """Tokenise a curl command, tolerant of unbalanced/odd quotes.
+
+    Behaves like shlex in posix mode for the common cases but never raises:
+    an unterminated quote simply swallows the remainder of the string as one
+    token instead of corrupting every token after it.  The shlex `posix=False`
+    fallback used to leave the literal quote characters inside tokens, which
+    turned `-H 'X-Note: it's broken'` into the bogus header `'X-Note -> it'`
+    and dropped the headers that followed.
+    """
+    tokens = []
+    cur = []
+    have = False  # whether `cur` represents a token (incl. an empty quoted one)
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in (" ", "\t", "\n", "\r"):
+            if have:
+                tokens.append("".join(cur))
+                cur, have = [], False
+            i += 1
+        elif ch in ("'", '"'):
+            quote = ch
+            have = True
+            i += 1
+            while i < n and text[i] != quote:
+                # Inside double quotes, honour the few shell backslash escapes.
+                if (quote == '"' and text[i] == "\\" and i + 1 < n
+                        and text[i + 1] in ('"', "\\", "$", "`")):
+                    cur.append(text[i + 1])
+                    i += 2
+                else:
+                    cur.append(text[i])
+                    i += 1
+            if i < n:
+                i += 1  # consume closing quote (absent if unterminated)
+        elif ch == "\\" and i + 1 < n:
+            cur.append(text[i + 1])
+            have = True
+            i += 2
+        else:
+            cur.append(ch)
+            have = True
+            i += 1
+    if have:
+        tokens.append("".join(cur))
+    return tokens
 
 
 def parse_curl_command(text: str) -> dict:
     """Parse a curl command line into request parts.
 
-    Returns a dict: method, url, headers (dict), data (str or None),
-    is_form (bool), form (list of "k=v" / "k=@file" strings),
-    user (str "u:p" or None).  Best-effort: unknown flags are skipped.
+    Returns a dict: method, url, headers (list of (key, value) pairs — order
+    preserved, duplicates kept), data (str or None), is_form (bool),
+    form (list of "k=v" / "k=@file" strings), user (str "u:p" or None),
+    output_file (str or None).
+    Best-effort: unknown flags are skipped.
     """
     result = {
         "method": None,
         "url": None,
-        "headers": {},
+        "headers": [],
         "data_parts": [],
         "is_form": False,
         "form": [],
         "user": None,
         "get_with_data": False,
+        "output_file": None,
     }
 
     text = (text or "").strip()
     if looks_like_curl(text):
-        # drop the leading "curl" word
-        text = text[4:]
-    # Collapse shell line-continuations (backslash + newline) into spaces.
-    text = re.sub(r"\\\r?\n", " ", text)
-    # Some single-line widgets flatten newlines before paste handlers see them,
-    # leaving continuations as "\ --url" / "\ -H" tokens.
-    text = re.sub(r"\\\s+(?=(?:-{1,2}[A-Za-z]|https?://))", " ", text)
+        text = _strip_curl_command(text)
+    text = _normalise_curl_continuations(text)
 
     try:
         tokens = shlex.split(text, posix=True)
     except ValueError:
-        # Unbalanced quotes etc. — retry without posix escaping.
-        try:
-            tokens = shlex.split(text, posix=False)
-        except ValueError:
-            tokens = text.split()
+        # Unbalanced quotes etc. — use a tolerant splitter that keeps the
+        # remaining headers intact instead of mangling every later token.
+        tokens = _split_curl_tokens(text)
 
     i, n = 0, len(tokens)
 
@@ -295,13 +364,13 @@ def parse_curl_command(text: str) -> dict:
             if ":" in h:
                 k, v = h.split(":", 1)
                 if k.strip():
-                    result["headers"][k.strip()] = v.strip()
+                    result["headers"].append((k.strip(), v.strip()))
         elif tok in ("-A", "--user-agent"):
-            result["headers"]["User-Agent"] = take()
+            result["headers"].append(("User-Agent", take()))
         elif tok in ("-e", "--referer"):
-            result["headers"]["Referer"] = take()
+            result["headers"].append(("Referer", take()))
         elif tok in ("-b", "--cookie"):
-            result["headers"]["Cookie"] = take()
+            result["headers"].append(("Cookie", take()))
         elif tok in ("-u", "--user"):
             result["user"] = take()
         elif tok in ("-d", "--data", "--data-raw", "--data-ascii",
@@ -310,6 +379,12 @@ def parse_curl_command(text: str) -> dict:
         elif tok in ("-F", "--form", "--form-string"):
             result["is_form"] = True
             result["form"].append(take())
+        elif tok in ("-o", "--output"):
+            result["output_file"] = take()
+        elif tok.startswith("--output="):
+            result["output_file"] = tok.split("=", 1)[1]
+        elif tok.startswith("-o") and tok != "-o":
+            result["output_file"] = tok[2:]
         elif tok in ("-G", "--get"):
             result["get_with_data"] = True
         elif tok in _CURL_NOARG_FLAGS:
@@ -328,6 +403,51 @@ def parse_curl_command(text: str) -> dict:
     else:
         result["data"] = None
     return result
+
+
+def parse_curl_form_value(value: str):
+    """Return (kind, payload) for one curl -F value.
+
+    kind is "text" or "file". File payloads are attachment metadata compatible
+    with CurlPro's attachment list.
+    """
+    value = value or ""
+    if "=" not in value:
+        return "text", value
+
+    field, spec = value.split("=", 1)
+    field = field.strip() or "file"
+    if not spec.startswith("@"):
+        return "text", value
+
+    file_spec = spec[1:]
+    file_path, *options = file_spec.split(";")
+    file_path = file_path.strip().strip('"')
+    if not file_path:
+        return "text", value
+    opts = {}
+    for option in options:
+        if "=" not in option:
+            continue
+        key, opt_value = option.split("=", 1)
+        opts[key.strip().lower()] = opt_value.strip().strip('"')
+
+    expanded = os.path.expanduser(file_path)
+    path_obj = Path(expanded)
+    if not path_obj.is_absolute():
+        cwd_candidate = Path.cwd() / path_obj
+        if cwd_candidate.exists():
+            path_obj = cwd_candidate
+
+    path_str = str(path_obj)
+    filename = opts.get("filename") or os.path.basename(file_path) or "upload"
+    mime = opts.get("type") or mimetypes.guess_type(path_str)[0] or "application/octet-stream"
+    return "file", {
+        "field": field,
+        "path": path_str,
+        "filename": filename,
+        "mime": mime,
+    }
 
 
 # ---------------------------
@@ -428,6 +548,22 @@ _STRESS_SCRIPT_TEMPLATE = """\
 #                            json_body – replaces the configured JSON body
 #                            data      – replaces form/raw data
 #                            params    – replaces query params
+#
+# ctx also carries the request you configured in the app, so you can mutate ANY
+# field dynamically without hardcoding it:
+#     ctx['base_json']    – deep copy of the configured JSON body (dict/list/None)
+#     ctx['base_headers'] – dict copy of the configured headers
+#     ctx['base_data']    – deep copy of the configured form/raw data
+#     ctx['base_params']  – dict copy of the configured query params
+#     ctx['method'], ctx['url']
+#
+# ── Example 0: change ONE field per request, keep everything else as configured ─
+# #  Set FIELD to whatever key you want to vary (e.g. 'otp', 'email', 'amount').
+# FIELD = 'otp'
+# def before_request(ctx):
+#     body = dict(ctx.get('base_json') or {})
+#     body[FIELD] = f"{random.randint(0, 999999):06d}"   # your mutation here
+#     return {'json_body': body}
 #
 # ── Example 1: Bearer token fetched once, auto-refreshed on expiry ──────────
 # def setup(ctx):
@@ -536,8 +672,21 @@ class StressTestWorker(QThread):
     def run(self):
         import concurrent.futures as cf
         import threading as _threading
+        import copy as _copy
 
-        self._ctx = {'_lock': _threading.Lock()}
+        # Expose the configured request to scripts so they can mutate ANY field
+        # dynamically instead of hardcoding a body. Deep copies are handed out so
+        # scripts can freely modify them without touching the shared config.
+        cfg = self.config
+        self._ctx = {
+            '_lock': _threading.Lock(),
+            'method': cfg.get('method'),
+            'url': cfg.get('url'),
+            'base_json': _copy.deepcopy(cfg.get('json_body')),
+            'base_headers': dict(cfg.get('headers') or {}),
+            'base_data': _copy.deepcopy(cfg.get('data')),
+            'base_params': dict(cfg.get('params') or {}),
+        }
 
         setup_fn = self._script_fns.get('setup')
         if setup_fn:
@@ -601,8 +750,12 @@ class StressTestDialog(QDialog):
         self.request_config = request_config
         self.worker = None
         self._results = []
+        self._error_counts = {}     # error message -> count
+        self._log_cap = 500         # max rows kept in the Live Log table
+        self._seq = 0               # per-request sequence number for the log
+        self._t_start = None        # wall-clock start, for live RPS
         self.setWindowTitle("Stress Test")
-        self.resize(760, 700)
+        self.resize(1000, 840)
         self.init_ui()
 
     def init_ui(self):
@@ -649,7 +802,7 @@ class StressTestDialog(QDialog):
         self.script_editor = QPlainTextEdit()
         self.script_editor.setFont(_monospace_font(9))
         self.script_editor.setPlaceholderText(_STRESS_SCRIPT_TEMPLATE)
-        self.script_editor.setMinimumHeight(180)
+        self.script_editor.setMinimumHeight(140)
         sl.addWidget(self.script_editor)
 
         script_btn_row = QHBoxLayout()
@@ -689,27 +842,86 @@ class StressTestDialog(QDialog):
         layout.addWidget(self.progress_label)
         layout.addWidget(self.progress_bar)
 
-        # Results
-        results_group = QGroupBox("Results")
-        rl = QVBoxLayout(results_group)
+        # Live one-line counters (always visible, update as requests complete)
+        self.live_label = QLabel("—")
+        self.live_label.setFont(_monospace_font(10))
+        self.live_label.setStyleSheet("color:#0d6efd;")
+        layout.addWidget(self.live_label)
+
+        # Results — tabbed so there is room for detail
+        results_tabs = QTabWidget()
+
+        # -- Summary tab --
+        summary_tab = QWidget()
+        stab = QVBoxLayout(summary_tab)
 
         self.stats_label = QLabel("—")
         self.stats_label.setWordWrap(True)
-        f2 = self.stats_label.font()
-        f2.setFamily("Consolas")
-        self.stats_label.setFont(f2)
-        rl.addWidget(self.stats_label)
+        self.stats_label.setFont(_monospace_font(10))
+        self.stats_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.stats_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        stab.addWidget(self.stats_label)
 
+        self.latency_label = QLabel("")
+        self.latency_label.setFont(_monospace_font(9))
+        self.latency_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.latency_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        stab.addWidget(self.latency_label)
+
+        stab.addWidget(QLabel("Status codes:"))
         self.status_table = QTableWidget(0, 3)
         self.status_table.setHorizontalHeaderLabels(["Status", "Count", "%"])
         sh = self.status_table.horizontalHeader()
         sh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         sh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         sh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.status_table.setMaximumHeight(160)
         self.status_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        rl.addWidget(self.status_table)
-        layout.addWidget(results_group)
+        self.status_table.verticalHeader().setVisible(False)
+        stab.addWidget(self.status_table, 1)
+        results_tabs.addTab(summary_tab, "Summary")
+
+        # -- Live Log tab --
+        log_tab = QWidget()
+        ltab = QVBoxLayout(log_tab)
+        log_hint = QLabel(f"Most recent requests (newest first, capped at {self._log_cap} rows).")
+        log_hint.setStyleSheet("color:#888;")
+        ltab.addWidget(log_hint)
+        self.log_table = QTableWidget(0, 4)
+        self.log_table.setHorizontalHeaderLabels(["#", "Status", "Latency (ms)", "Error"])
+        lh = self.log_table.horizontalHeader()
+        lh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        lh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        lh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        lh.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.log_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.log_table.verticalHeader().setVisible(False)
+        ltab.addWidget(self.log_table, 1)
+        results_tabs.addTab(log_tab, "Live Log")
+
+        # -- Errors tab --
+        err_tab = QWidget()
+        etab = QVBoxLayout(err_tab)
+        etab.addWidget(QLabel("Distinct errors and how many times each occurred:"))
+        self.errors_table = QTableWidget(0, 2)
+        self.errors_table.setHorizontalHeaderLabels(["Count", "Error message"])
+        eh = self.errors_table.horizontalHeader()
+        eh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        eh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.errors_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.errors_table.verticalHeader().setVisible(False)
+        etab.addWidget(self.errors_table, 1)
+        results_tabs.addTab(err_tab, "Errors")
+
+        layout.addWidget(results_tabs, 1)
+
+        # Export row
+        export_row = QHBoxLayout()
+        export_row.addStretch()
+        self.export_btn = QPushButton("Export Results (CSV)…")
+        self.export_btn.clicked.connect(self._export_results)
+        self.export_btn.setEnabled(False)
+        export_row.addWidget(self.export_btn)
+        layout.addLayout(export_row)
 
     # ---------- Script helpers ----------
 
@@ -764,8 +976,16 @@ class StressTestDialog(QDialog):
                     return
 
         self._results = []
+        self._error_counts = {}
+        self._seq = 0
+        self._t_start = time.time()
         self.status_table.setRowCount(0)
+        self.log_table.setRowCount(0)
+        self.errors_table.setRowCount(0)
         self.stats_label.setText("—")
+        self.latency_label.setText("")
+        self.live_label.setText("Running…")
+        self.export_btn.setEnabled(False)
         total = self.total_spin.value()
         concurrency = self.concurrency_spin.value()
         self.progress_bar.setRange(0, total)
@@ -797,20 +1017,58 @@ class StressTestDialog(QDialog):
 
     def _on_result(self, result):
         self._results.append(result)
+        self._seq += 1
+        if result.get('error'):
+            msg = result['error']
+            self._error_counts[msg] = self._error_counts.get(msg, 0) + 1
+        self._append_log_row(self._seq, result)
+        self._update_live_label()
+
         n = self.total_spin.value()
+        # Heavy full-sort stats are throttled so huge runs stay responsive.
         if len(self._results) % max(1, n // 20) == 0:
             self._refresh_stats()
+            self._refresh_errors()
 
     def _on_done(self, summary):
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.export_btn.setEnabled(bool(self._results))
         self._refresh_stats()
+        self._refresh_errors()
+        self._update_live_label()
         wall = summary.get('wall_ms', 0)
         rps = summary.get('rps', 0)
         total = summary.get('total', 0)
         self.progress_label.setText(
             f"Done — {total} requests in {wall:.0f} ms  ({rps:.1f} req/s)"
         )
+
+    # ---------- Live / stats rendering ----------
+
+    def _update_live_label(self):
+        rs = self._results
+        n = len(rs)
+        if not n:
+            self.live_label.setText("—")
+            return
+        successes = sum(1 for r in rs if r['error'] is None and 200 <= r['status'] < 400)
+        errors = sum(1 for r in rs if r['error'] is not None)
+        elapsed = max(1e-6, time.time() - (self._t_start or time.time()))
+        rps = n / elapsed
+        total = self.total_spin.value()
+        remaining = max(0, total - n)
+        self.live_label.setText(
+            f"Done {n}/{total}   ✓ {successes}   ✗ {errors}   "
+            f"{rps:.0f} req/s   remaining {remaining}"
+        )
+
+    @staticmethod
+    def _pct(sorted_times, q):
+        if not sorted_times:
+            return 0.0
+        n = len(sorted_times)
+        return sorted_times[min(n - 1, max(0, int(round(q * n)) - 1))]
 
     def _refresh_stats(self):
         rs = self._results
@@ -819,16 +1077,20 @@ class StressTestDialog(QDialog):
         times = [r['elapsed'] for r in rs]
         st = sorted(times)
         n = len(st)
-        p95 = st[max(0, int(n * 0.95) - 1)]
-        p50 = st[n // 2]
+        p50 = self._pct(st, 0.50)
+        p90 = self._pct(st, 0.90)
+        p95 = self._pct(st, 0.95)
+        p99 = self._pct(st, 0.99)
         successes = sum(1 for r in rs if r['error'] is None and 200 <= r['status'] < 400)
         errors = sum(1 for r in rs if r['error'] is not None)
 
         self.stats_label.setText(
-            f"Completed: {n}   Success: {successes}   Errors: {errors}\n"
-            f"Avg: {sum(times)/n:.1f} ms   Min: {st[0]:.1f} ms   "
-            f"Max: {st[-1]:.1f} ms   P50: {p50:.1f} ms   P95: {p95:.1f} ms"
+            f"Completed: {n}    Success: {successes}    Errors: {errors}\n"
+            f"Latency  avg {sum(times)/n:7.1f} ms   min {st[0]:7.1f} ms   max {st[-1]:7.1f} ms\n"
+            f"         p50 {p50:7.1f} ms   p90 {p90:7.1f} ms   "
+            f"p95 {p95:7.1f} ms   p99 {p99:7.1f} ms"
         )
+        self.latency_label.setText(self._latency_histogram(st))
 
         statuses = {}
         for r in rs:
@@ -844,17 +1106,95 @@ class StressTestDialog(QDialog):
             pi = QTableWidgetItem(f"{count/n*100:.1f}%")
             for item in (si, ci, pi):
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            if status == 0 or status >= 400:
-                color = QColor('#dc3545')
-            elif 200 <= status < 300:
-                color = QColor('#28a745')
-            else:
-                color = QColor('#fd7e14')
+            color = self._status_color(status)
             for item in (si, ci, pi):
                 item.setForeground(color)
             self.status_table.setItem(row, 0, si)
             self.status_table.setItem(row, 1, ci)
             self.status_table.setItem(row, 2, pi)
+
+    def _latency_histogram(self, sorted_times, buckets=10, width=40):
+        """A tiny text histogram of latencies — no extra dependencies."""
+        if not sorted_times:
+            return ""
+        lo, hi = sorted_times[0], sorted_times[-1]
+        if hi <= lo:
+            return f"Latency spread: all ≈ {lo:.1f} ms"
+        span = hi - lo
+        counts = [0] * buckets
+        for t in sorted_times:
+            idx = min(buckets - 1, int((t - lo) / span * buckets))
+            counts[idx] += 1
+        peak = max(counts) or 1
+        lines = ["Latency distribution:"]
+        for i, c in enumerate(counts):
+            b_lo = lo + span * i / buckets
+            b_hi = lo + span * (i + 1) / buckets
+            bar = "█" * int(c / peak * width)
+            lines.append(f"{b_lo:7.0f}–{b_hi:<7.0f} ms | {bar} {c}")
+        return "\n".join(lines)
+
+    def _refresh_errors(self):
+        self.errors_table.setRowCount(0)
+        for msg, count in sorted(self._error_counts.items(), key=lambda kv: -kv[1]):
+            row = self.errors_table.rowCount()
+            self.errors_table.insertRow(row)
+            ci = QTableWidgetItem(str(count))
+            ci.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            mi = QTableWidgetItem(msg)
+            self.errors_table.setItem(row, 0, ci)
+            self.errors_table.setItem(row, 1, mi)
+
+    @staticmethod
+    def _status_color(status):
+        if status == 0 or status >= 400:
+            return QColor('#dc3545')
+        if 200 <= status < 300:
+            return QColor('#28a745')
+        return QColor('#fd7e14')
+
+    def _append_log_row(self, seq, result):
+        status = result.get('status', 0)
+        table = self.log_table
+        table.insertRow(0)
+        label = str(status) if status else 'ERR'
+        cells = [
+            QTableWidgetItem(str(seq)),
+            QTableWidgetItem(label),
+            QTableWidgetItem(f"{result.get('elapsed', 0):.1f}"),
+            QTableWidgetItem(result.get('error') or ""),
+        ]
+        color = self._status_color(status)
+        for col, item in enumerate(cells):
+            if col != 3:
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            item.setForeground(color)
+            table.setItem(0, col, item)
+        # Cap the table so long runs don't grow the widget without bound.
+        while table.rowCount() > self._log_cap:
+            table.removeRow(table.rowCount() - 1)
+
+    def _export_results(self):
+        if not self._results:
+            return
+        fname, _ = QFileDialog.getSaveFileName(
+            self, "Export Stress Results",
+            str(Path.home() / "stress_results.csv"),
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        if not fname:
+            return
+        try:
+            import csv
+            with open(fname, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(["seq", "status", "elapsed_ms", "error"])
+                for i, r in enumerate(self._results, 1):
+                    writer.writerow([i, r.get('status', 0),
+                                     f"{r.get('elapsed', 0):.3f}", r.get('error') or ""])
+            QMessageBox.information(self, "Exported", f"Wrote {len(self._results)} rows to {fname}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", str(e))
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():
@@ -1279,6 +1619,8 @@ class CurlProMainWindow(QMainWindow):
         self._request_store = {}   # req_id -> {thread, info, snapshot, result, error, elapsed}
         self._req_counter = 0
         self.file_attachments = []  # [{field, path, filename, mime}]
+        self._pending_output_file = None  # from imported curl --output/-o
+        self._last_output_file = None     # suggested name for the loaded response
 
         self.init_ui()
         self.init_status_bar()
@@ -1441,6 +1783,7 @@ class CurlProMainWindow(QMainWindow):
         # Pressing Enter anywhere in the URL bar fires the request — the single
         # most expected interaction in a tool like this.
         self.url_input.returnPressed.connect(self.send_request)
+        self.url_input.textEdited.connect(self._clear_pending_output_file)
 
         self.send_btn = QPushButton("Send")
         self.send_btn.setObjectName("send_btn")
@@ -1802,8 +2145,12 @@ class CurlProMainWindow(QMainWindow):
         resp = self._last_response
         body = self._last_response_bytes or b""
 
-        # Suggest a filename
-        suggested = self._infer_filename_from_headers(resp)
+        # Suggest a filename. A pasted `curl --output report.docx` should win,
+        # then response headers, then URL/content-type inference.
+        preferred_output = (self._last_output_file or "").strip()
+        if preferred_output == "-":
+            preferred_output = ""
+        suggested = preferred_output or self._infer_filename_from_headers(resp)
         ct = resp.headers.get("Content-Type", "")
         if not suggested:
             # derive from URL or content-type
@@ -1814,7 +2161,12 @@ class CurlProMainWindow(QMainWindow):
                 ext = self._infer_ext_from_content_type(ct) or ".bin"
             suggested = base_name + ("" if base_name.endswith(ext) else ext)
 
-        fname, _ = QFileDialog.getSaveFileName(self, "Save Response Body", str(Path.home() / suggested), "All Files (*)")
+        suggested_path = Path(os.path.expanduser(suggested))
+        if not suggested_path.is_absolute():
+            base_dir = Path.cwd() if preferred_output else Path.home()
+            suggested_path = base_dir / suggested_path
+
+        fname, _ = QFileDialog.getSaveFileName(self, "Save Response Body", str(suggested_path), "All Files (*)")
         if not fname:
             return
         try:
@@ -2095,6 +2447,7 @@ class CurlProMainWindow(QMainWindow):
 
         self._last_response = response
         self._last_response_bytes = response.content or b""
+        self._last_output_file = result.get('output_file')
 
         self.response_summary.setText(
             f"Status: {status_code} {status_text} — Time: {elapsed*1000:.0f} ms — Size: {size:,} bytes"
@@ -2329,6 +2682,9 @@ class CurlProMainWindow(QMainWindow):
         color = colors.get(method, "#6c757d")
         self.method_combo.setStyleSheet(f"QComboBox {{ color: {color}; font-weight: bold; }}")
 
+    def _clear_pending_output_file(self, *_args):
+        self._pending_output_file = None
+
     def import_curl(self, text):
         """Populate the request form from a pasted curl command."""
         parsed = parse_curl_command(text)
@@ -2339,7 +2695,9 @@ class CurlProMainWindow(QMainWindow):
             self.status_bar.showMessage("Couldn't parse curl command — pasted as text")
             return False
 
-        headers = dict(parsed["headers"])
+        # Ordered list of (key, value) pairs — duplicates (e.g. repeated
+        # Cookie/Set-Cookie) are preserved instead of collapsing into a dict.
+        header_pairs = list(parsed["headers"])
 
         # Method: explicit -X wins, otherwise infer from the presence of a body.
         method = parsed["method"]
@@ -2355,33 +2713,58 @@ class CurlProMainWindow(QMainWindow):
 
         self.url_input.setText(parsed["url"])
 
-        # Lift recognised auth out of the headers into the Auth tab.
+        # Lift a recognised Bearer token out of the headers into the Auth tab.
         auth_cfg = {"type": "No Auth"}
-        auth_header = next((k for k in headers if k.lower() == "authorization"), None)
-        if auth_header:
-            val = headers[auth_header].strip()
-            if val.lower().startswith("bearer "):
-                auth_cfg = {"type": "Bearer Token", "token": val[7:].strip()}
-                del headers[auth_header]
+        kept_pairs = []
+        for k, v in header_pairs:
+            if (k.lower() == "authorization" and auth_cfg["type"] == "No Auth"
+                    and v.strip().lower().startswith("bearer ")):
+                auth_cfg = {"type": "Bearer Token", "token": v.strip()[7:].strip()}
+                continue  # drop from the headers box — it now lives in Auth
+            kept_pairs.append((k, v))
         if parsed["user"]:
             user, _, pwd = parsed["user"].partition(":")
             auth_cfg = {"type": "Basic Auth", "username": user, "password": pwd}
         self.set_auth_config(auth_cfg)
 
-        # Headers text — one "Key: Value" per line.
+        # Headers text — one "Key: Value" per line (duplicates preserved).
         self.headers_text.setPlainText(
-            "\n".join(f"{k}: {v}" for k, v in headers.items())
+            "\n".join(f"{k}: {v}" for k, v in kept_pairs)
         )
 
+        self._pending_output_file = (parsed.get("output_file") or "").strip() or None
+        status_notes = []
+        if self._pending_output_file and self._pending_output_file != "-":
+            status_notes.append(f"output: {self._pending_output_file}")
+
         # Body.
-        content_type = next((v for k, v in headers.items() if k.lower() == "content-type"), "").lower()
+        self.clear_attachments()
+        content_type = next(
+            (v for k, v in kept_pairs if k.lower() == "content-type"), ""
+        ).lower()
         if parsed["is_form"]:
             self.body_type_combo.setCurrentText("Form Data")
-            text_fields = [f for f in parsed["form"] if "=@" not in f and not f.startswith("@")]
+            text_fields = []
+            file_attachments = []
+            for form_value in parsed["form"]:
+                kind, payload = parse_curl_form_value(form_value)
+                if kind == "file":
+                    file_attachments.append(payload)
+                else:
+                    text_fields.append(payload)
             self.body_text.setPlainText("&".join(text_fields))
-            file_fields = [f for f in parsed["form"] if f not in text_fields]
-            note = "  (file fields ignored — add them under Attachments)" if file_fields else ""
-            self.status_bar.showMessage(f"Imported curl — {method} {parsed['url'][:60]}{note}")
+            if file_attachments:
+                self.restore_attachments(file_attachments)
+                status_notes.append(
+                    f"{len(file_attachments)} file field"
+                    f"{'s' if len(file_attachments) != 1 else ''}"
+                )
+                missing = sum(
+                    1 for att in file_attachments
+                    if not (att.get("path") and os.path.exists(att["path"]))
+                )
+                if missing:
+                    status_notes.append(f"{missing} missing")
         elif parsed["data"]:
             body = parsed["data"]
             is_json = "application/json" in content_type or body.lstrip().startswith(("{", "["))
@@ -2394,10 +2777,11 @@ class CurlProMainWindow(QMainWindow):
             else:
                 self.body_type_combo.setCurrentText("Raw")
             self.body_text.setPlainText(body)
-            self.status_bar.showMessage(f"Imported curl — {method} {parsed['url'][:60]}")
         else:
             self.body_text.setPlainText("")
-            self.status_bar.showMessage(f"Imported curl — {method} {parsed['url'][:60]}")
+
+        note = f" ({'; '.join(status_notes)})" if status_notes else ""
+        self.status_bar.showMessage(f"Imported curl — {method} {parsed['url'][:60]}{note}")
 
         self._update_method_color()
         return True
@@ -2495,6 +2879,7 @@ class CurlProMainWindow(QMainWindow):
             'request_body': self.body_text.toPlainText(),
             'auth': self.get_auth_config(),
             'attachments': self._attachments_snapshot(),
+            'output_file': self._pending_output_file,
         }
 
         req_id = self._req_counter
@@ -2534,6 +2919,7 @@ class CurlProMainWindow(QMainWindow):
         response = result['response']
         elapsed = result['elapsed']
         snapshot = store.get('snapshot', {}) if store else {}
+        result['output_file'] = snapshot.get('output_file')
 
         self._load_response_to_ui(result)
 
@@ -2559,6 +2945,7 @@ class CurlProMainWindow(QMainWindow):
                 "body_type": snapshot.get('body_type', self.body_type_combo.currentText()),
                 "auth": snapshot.get('auth', self.get_auth_config()),
                 "attachments": snapshot.get('attachments', self._attachments_snapshot()),
+                "output_file": snapshot.get('output_file'),
             }
             entry["_id"] = add_history(entry)
             self.history.append(entry)
@@ -2613,6 +3000,7 @@ class CurlProMainWindow(QMainWindow):
                 "body_type": snapshot.get('body_type', self.body_type_combo.currentText()),
                 "auth": snapshot.get('auth', self.get_auth_config()),
                 "attachments": snapshot.get('attachments', self._attachments_snapshot()),
+                "output_file": snapshot.get('output_file'),
             }
             entry["_id"] = add_history(entry)
             self.history.append(entry)
@@ -2638,6 +3026,7 @@ class CurlProMainWindow(QMainWindow):
             "body": self.body_text.toPlainText(),
             "auth": self.get_auth_config(),
             "attachments": self._attachments_snapshot(),
+            "output_file": self._pending_output_file,
         }
         coll.append(req)
         save_document("collections", self.collections)
@@ -2656,6 +3045,7 @@ class CurlProMainWindow(QMainWindow):
             "body": self.body_text.toPlainText(),
             "auth": self.get_auth_config(),
             "attachments": self._attachments_snapshot(),
+            "output_file": self._pending_output_file,
         }
         try:
             Path(fname).write_text(json.dumps(req, indent=2))
@@ -2676,6 +3066,7 @@ class CurlProMainWindow(QMainWindow):
             self.body_text.setPlainText(data.get("body", ""))
             self.restore_attachments(data.get("attachments", []))
             self.set_auth_config(data.get("auth", {}))
+            self._pending_output_file = data.get("output_file") or None
             QMessageBox.information(self, "Loaded", f"Request loaded from {fname}")
         except Exception as e:
             QMessageBox.critical(self, "Load Error", str(e))
@@ -2716,6 +3107,7 @@ class CurlProMainWindow(QMainWindow):
                 self.body_text.setPlainText(req.get("body", ""))
                 self.restore_attachments(req.get("attachments", []))
                 self.set_auth_config(req.get("auth", {}))
+                self._pending_output_file = req.get("output_file") or None
                 QMessageBox.information(self, "Loaded", f"Loaded request from collection '{coll}'")
             except Exception as e:
                 QMessageBox.critical(self, "Load Error", str(e))
@@ -2752,6 +3144,8 @@ class CurlProMainWindow(QMainWindow):
         # Restore auth configuration
         if "auth" in data:
             self.set_auth_config(data.get("auth", {}))
+
+        self._pending_output_file = data.get("output_file") or None
 
         self.status_bar.showMessage(f"Loaded from history: {data.get('method', '')} {data.get('url', '')}")
 
@@ -2818,6 +3212,9 @@ class CurlProMainWindow(QMainWindow):
             parts += ["-H", shlex.quote(f"{k}: {v}")]
         if body:
             parts += ["--data-raw", shlex.quote(body)]
+        output_file = (data.get("output_file") or "").strip()
+        if output_file and output_file != "-":
+            parts += ["--output", shlex.quote(output_file)]
         parts.append(shlex.quote(url))
         QApplication.clipboard().setText(" ".join(parts))
         self.status_bar.showMessage("Copied request as cURL")
@@ -3014,6 +3411,10 @@ class CurlProMainWindow(QMainWindow):
         else:
             if body_raw:
                 parts += ["--data-raw", shlex.quote(body_raw)]
+
+        output_file = (self._pending_output_file or "").strip()
+        if output_file and output_file != "-":
+            parts += ["--output", shlex.quote(output_file)]
 
         parts += [shlex.quote(url)]
         return " ".join(parts)
