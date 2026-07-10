@@ -19,6 +19,10 @@ import datetime as _dt
 from pathlib import Path
 import shlex
 import base64
+import secrets
+import hashlib
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote, urlparse, urlencode, parse_qsl, urlunparse
 import requests
 from requests.adapters import HTTPAdapter
@@ -34,7 +38,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QDialog, QDialogButtonBox, QProgressBar, QStatusBar,
     QToolButton, QMenu, QPlainTextEdit, QStackedWidget,
     QTableWidget, QTableWidgetItem, QHeaderView, QSpinBox, QDoubleSpinBox,
-    QCheckBox, QWidgetAction
+    QCheckBox, QWidgetAction, QFormLayout, QGridLayout
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QClipboard, QColor, QShortcut, QKeySequence, QFont, QPixmap
@@ -261,6 +265,103 @@ def add_params_to_url(url: str, params) -> str:
 def strip_query_from_url(url: str) -> str:
     parsed = urlparse(url)
     return urlunparse(parsed._replace(query=""))
+
+
+# ---------------------------
+# OAuth 2.0 (Client Credentials / Authorization Code + PKCE)
+# ---------------------------
+class OAuth2TokenMissing(Exception):
+    """Raised by apply_auth() when OAuth 2.0 is selected but no valid access
+    token (or usable refresh token) is available — the caller should prompt
+    the user to run the "Get New Access Token" flow."""
+
+
+def _pkce_pair():
+    """Return (code_verifier, code_challenge) for an RFC 7636 PKCE exchange."""
+    verifier = secrets.token_urlsafe(64)[:128]
+    if len(verifier) < 43:
+        verifier = verifier.ljust(43, "a")
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+def build_authorization_url(auth_url, *, client_id, redirect_uri, state, code_challenge,
+                             scope=None, extra_params=None):
+    """Build the browser URL that starts an OAuth 2.0 Authorization Code + PKCE flow."""
+    params = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+    if scope:
+        params["scope"] = scope
+    if extra_params:
+        params.update(extra_params)
+    parsed = urlparse(auth_url)
+    existing = parse_qsl(parsed.query, keep_blank_values=True)
+    merged = existing + list(params.items())
+    return urlunparse(parsed._replace(query=urlencode(merged)))
+
+
+def oauth2_request_token(token_url, grant_type, *, client_id, client_secret=None,
+                          scope=None, code=None, redirect_uri=None, code_verifier=None,
+                          refresh_token=None, auth_in_body=False, verify_ssl=True,
+                          timeout=15):
+    """POST an OAuth 2.0 token request (client_credentials / authorization_code /
+    refresh_token grants) and return the parsed JSON token response.
+
+    Raises RuntimeError (with the provider's error/error_description, if any) on
+    any failure, so callers can surface a single readable message to the user.
+    """
+    data = {"grant_type": grant_type}
+    if grant_type == "client_credentials":
+        if scope:
+            data["scope"] = scope
+    elif grant_type == "authorization_code":
+        data["code"] = code
+        data["redirect_uri"] = redirect_uri
+        if code_verifier:
+            data["code_verifier"] = code_verifier
+    elif grant_type == "refresh_token":
+        data["refresh_token"] = refresh_token
+        if scope:
+            data["scope"] = scope
+
+    auth = None
+    if client_id and not auth_in_body:
+        auth = (client_id, client_secret or "")
+    else:
+        if client_id:
+            data["client_id"] = client_id
+        if client_secret:
+            data["client_secret"] = client_secret
+
+    try:
+        resp = requests.post(
+            token_url, data=data, auth=auth,
+            headers={"Accept": "application/json"},
+            timeout=timeout, verify=verify_ssl,
+        )
+    except requests.RequestException as e:
+        raise RuntimeError(f"Token request failed: {e}") from e
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = {}
+
+    if not resp.ok or "access_token" not in payload:
+        detail = (
+            payload.get("error_description") or payload.get("error")
+            or resp.text[:300] or resp.reason
+        )
+        raise RuntimeError(f"Token endpoint returned {resp.status_code}: {detail}")
+
+    return payload
 
 
 def make_retry_session(retry_total=0, retry_backoff=0.0, retry_statuses=None, max_redirects=30):
@@ -621,6 +722,109 @@ class RequestThread(QThread):
                                 pass
             except Exception:
                 pass
+
+
+# ---------------------------
+# OAuth 2.0 network helpers (run off the UI thread, like RequestThread)
+# ---------------------------
+class _OAuth2TokenThread(QThread):
+    """Runs one oauth2_request_token() call in the background."""
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, kwargs):
+        super().__init__()
+        self._kwargs = kwargs
+
+    def run(self):
+        try:
+            token = oauth2_request_token(**self._kwargs)
+            self.finished.emit(token)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class _OAuth2CallbackHandler(BaseHTTPRequestHandler):
+    """Captures the single redirect from an Authorization Code flow."""
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path != self.server.callback_path:
+            self.send_response(404)
+            self.end_headers()
+            return
+        qs = dict(parse_qsl(parsed.query))
+        self.server.captured = qs
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        if qs.get("error"):
+            body = f"<html><body><h3>Authorization failed</h3><p>{qs.get('error_description', qs['error'])}</p><p>You can close this window.</p></body></html>"
+        else:
+            body = "<html><body><h3>Authorization complete</h3><p>You can close this window and return to CurlPro.</p></body></html>"
+        self.wfile.write(body.encode("utf-8"))
+
+    def log_message(self, format, *args):
+        pass  # silence default stderr access logging
+
+
+class _OAuth2CallbackServer(QThread):
+    """Listens on loopback for the OAuth 2.0 Authorization Code redirect."""
+    code_received = pyqtSignal(str, str)   # code, state
+    error = pyqtSignal(str)
+
+    def __init__(self, host, port, path, overall_timeout=180):
+        super().__init__()
+        self._host = host
+        self._port = port
+        self._path = path or "/"
+        self._overall_timeout = overall_timeout
+        self._stopped = False
+        self._server = None
+
+    def stop(self):
+        self._stopped = True
+        try:
+            if self._server is not None:
+                self._server.server_close()
+        except Exception:
+            pass
+
+    def run(self):
+        try:
+            server = HTTPServer((self._host, self._port), _OAuth2CallbackHandler)
+        except OSError as e:
+            self.error.emit(f"Could not listen on {self._host}:{self._port} — {e}")
+            return
+        server.callback_path = self._path
+        server.captured = None
+        server.timeout = 1.0
+        self._server = server
+        deadline = time.time() + self._overall_timeout
+        try:
+            while not self._stopped and time.time() < deadline:
+                server.handle_request()
+                if server.captured is not None:
+                    qs = server.captured
+                    if qs.get("error"):
+                        self.error.emit(qs.get("error_description") or qs["error"])
+                    else:
+                        code = qs.get("code")
+                        state = qs.get("state", "")
+                        if code:
+                            self.code_received.emit(code, state)
+                        else:
+                            self.error.emit("No authorization code in redirect.")
+                    return
+            if not self._stopped:
+                self.error.emit("Timed out waiting for browser authorization.")
+        finally:
+            try:
+                server.server_close()
+            except Exception:
+                pass
+
+
 # ---------------------------
 # Stress test worker & dialog
 # ---------------------------
@@ -1991,7 +2195,7 @@ class CurlProMainWindow(QMainWindow):
 
         body_toolbar = QHBoxLayout()
         self.body_type_combo = QComboBox()
-        self.body_type_combo.addItems(["Raw", "JSON", "Form Data", "Binary"])
+        self.body_type_combo.addItems(["Raw", "JSON", "Form Data", "Binary", "GraphQL"])
         self.body_type_combo.currentTextChanged.connect(self.on_body_type_changed)
         body_toolbar.addWidget(QLabel("Body Type:"))
         body_toolbar.addWidget(self.body_type_combo)
@@ -2033,6 +2237,25 @@ class CurlProMainWindow(QMainWindow):
         # hidden unless Form Data is selected
         self.attachments_group.setVisible(False)
         body_layout.addWidget(self.attachments_group)
+
+        # --- GraphQL panel (query goes in body_text above; variables/operation here) ---
+        self.graphql_group = QGroupBox("GraphQL")
+        graphql_layout = QVBoxLayout(self.graphql_group)
+
+        graphql_layout.addWidget(QLabel("Operation Name (optional):"))
+        self.graphql_operation_name = QLineEdit()
+        self.graphql_operation_name.setPlaceholderText("e.g. GetUser")
+        graphql_layout.addWidget(self.graphql_operation_name)
+
+        graphql_layout.addWidget(QLabel("Variables (JSON):"))
+        self.graphql_variables_text = QTextEdit()
+        self.graphql_variables_text.setPlaceholderText('{\n  "id": "{{USER_ID}}"\n}')
+        self.graphql_variables_text.setMaximumHeight(150)
+        graphql_layout.addWidget(self.graphql_variables_text)
+
+        # hidden unless GraphQL is selected
+        self.graphql_group.setVisible(False)
+        body_layout.addWidget(self.graphql_group)
 
         self.request_tabs.addTab(body_widget, "Body")
 
@@ -2248,65 +2471,99 @@ class CurlProMainWindow(QMainWindow):
 
     # ---------- Advanced transport ----------
     def create_advanced_tab(self):
-        advanced_widget = QWidget()
-        layout = QVBoxLayout(advanced_widget)
+        advanced_widget = QScrollArea()
+        advanced_widget.setWidgetResizable(True)
+        advanced_widget.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(14)
+
+        intro = QLabel(
+            "Fine-tune redirects, certificate validation, and automatic retry behaviour."
+        )
+        intro.setWordWrap(True)
+        intro.setObjectName("formHint")
+        layout.addWidget(intro)
 
         transport_group = QGroupBox("Transport")
-        transport_layout = QVBoxLayout(transport_group)
+        transport_layout = QGridLayout(transport_group)
+        transport_layout.setHorizontalSpacing(18)
+        transport_layout.setVerticalSpacing(12)
+        transport_layout.setColumnStretch(1, 1)
 
         self.follow_redirects_check = QCheckBox("Follow redirects")
         self.follow_redirects_check.setChecked(bool(self.settings.get("follow_redirects", True)))
         self.verify_ssl_check = QCheckBox("Verify SSL certificates")
         self.verify_ssl_check.setChecked(bool(self.settings.get("verify_ssl", True)))
 
-        max_redirects_row = QHBoxLayout()
-        max_redirects_row.addWidget(QLabel("Max redirects:"))
         self.max_redirects_spin = QSpinBox()
         self.max_redirects_spin.setRange(1, 100)
         self.max_redirects_spin.setValue(int(self.settings.get("max_redirects", 30)))
-        self.max_redirects_spin.setFixedWidth(90)
-        max_redirects_row.addWidget(self.max_redirects_spin)
-        max_redirects_row.addStretch()
-
-        transport_layout.addWidget(self.follow_redirects_check)
-        transport_layout.addWidget(self.verify_ssl_check)
-        transport_layout.addLayout(max_redirects_row)
+        self.max_redirects_spin.setMinimumWidth(120)
+        transport_layout.addWidget(self.follow_redirects_check, 0, 0, 1, 2)
+        transport_layout.addWidget(self.verify_ssl_check, 1, 0, 1, 2)
+        self.max_redirects_label = QLabel("Maximum redirects")
+        transport_layout.addWidget(self.max_redirects_label, 2, 0)
+        transport_layout.addWidget(self.max_redirects_spin, 2, 1, alignment=Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(transport_group)
 
         retry_group = QGroupBox("Retries")
-        retry_layout = QVBoxLayout(retry_group)
+        retry_layout = QGridLayout(retry_group)
+        retry_layout.setHorizontalSpacing(18)
+        retry_layout.setVerticalSpacing(12)
+        retry_layout.setColumnStretch(1, 1)
 
-        retry_row = QHBoxLayout()
-        retry_row.addWidget(QLabel("Retry attempts:"))
         self.retry_total_spin = QSpinBox()
         self.retry_total_spin.setRange(0, 10)
         self.retry_total_spin.setValue(int(self.settings.get("retry_total", 0)))
-        self.retry_total_spin.setFixedWidth(90)
-        retry_row.addWidget(self.retry_total_spin)
-        retry_row.addSpacing(18)
-        retry_row.addWidget(QLabel("Backoff:"))
+        self.retry_total_spin.setMinimumWidth(120)
         self.retry_backoff_spin = QDoubleSpinBox()
         self.retry_backoff_spin.setRange(0.0, 60.0)
         self.retry_backoff_spin.setDecimals(2)
         self.retry_backoff_spin.setSingleStep(0.25)
         self.retry_backoff_spin.setSuffix(" s")
         self.retry_backoff_spin.setValue(float(self.settings.get("retry_backoff", 0.25)))
-        self.retry_backoff_spin.setFixedWidth(110)
-        retry_row.addWidget(self.retry_backoff_spin)
-        retry_row.addStretch()
-        retry_layout.addLayout(retry_row)
+        self.retry_backoff_spin.setMinimumWidth(140)
+        retry_layout.addWidget(QLabel("Retry attempts"), 0, 0)
+        retry_layout.addWidget(self.retry_total_spin, 0, 1, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.retry_backoff_label = QLabel("Backoff delay")
+        retry_layout.addWidget(self.retry_backoff_label, 1, 0)
+        retry_layout.addWidget(self.retry_backoff_spin, 1, 1, alignment=Qt.AlignmentFlag.AlignLeft)
 
-        statuses_row = QHBoxLayout()
-        statuses_row.addWidget(QLabel("Retry status codes:"))
         self.retry_statuses_input = QLineEdit()
         self.retry_statuses_input.setPlaceholderText("429,500,502,503,504")
         self.retry_statuses_input.setText(str(self.settings.get("retry_statuses", "429,500,502,503,504")))
-        statuses_row.addWidget(self.retry_statuses_input)
-        retry_layout.addLayout(statuses_row)
+        self.retry_statuses_label = QLabel("HTTP status codes")
+        retry_layout.addWidget(self.retry_statuses_label, 2, 0)
+        retry_layout.addWidget(self.retry_statuses_input, 2, 1)
+
+        retry_hint = QLabel("Comma-separated response codes that should trigger another attempt.")
+        retry_hint.setWordWrap(True)
+        retry_hint.setObjectName("formHint")
+        self.retry_hint = retry_hint
+        retry_layout.addWidget(retry_hint, 3, 1)
 
         layout.addWidget(retry_group)
         layout.addStretch()
+        advanced_widget.setWidget(content)
+        self.follow_redirects_check.toggled.connect(self._update_advanced_enabled_state)
+        self.retry_total_spin.valueChanged.connect(self._update_advanced_enabled_state)
+        self._update_advanced_enabled_state()
         return advanced_widget
+
+    def _update_advanced_enabled_state(self, *_args):
+        """Disable dependent options when their parent feature is off."""
+        redirects_enabled = self.follow_redirects_check.isChecked()
+        self.max_redirects_label.setEnabled(redirects_enabled)
+        self.max_redirects_spin.setEnabled(redirects_enabled)
+
+        retries_enabled = self.retry_total_spin.value() > 0
+        for widget in (
+            self.retry_backoff_label, self.retry_backoff_spin,
+            self.retry_statuses_label, self.retry_statuses_input, self.retry_hint,
+        ):
+            widget.setEnabled(retries_enabled)
 
     def _advanced_snapshot(self):
         if not hasattr(self, "follow_redirects_check"):
@@ -2334,6 +2591,7 @@ class CurlProMainWindow(QMainWindow):
             self.retry_backoff_spin.setValue(float(cfg.get("retry_backoff") or 0))
         if "retry_statuses" in cfg:
             self.retry_statuses_input.setText(str(cfg.get("retry_statuses") or ""))
+        self._update_advanced_enabled_state()
 
     # ---------- Auth ----------
     def create_auth_tab(self):
@@ -2343,7 +2601,7 @@ class CurlProMainWindow(QMainWindow):
         type_row = QHBoxLayout()
         type_row.addWidget(QLabel("Type:"))
         self.auth_type_combo = QComboBox()
-        self.auth_type_combo.addItems(["No Auth", "Bearer Token", "Basic Auth", "API Key"])
+        self.auth_type_combo.addItems(["No Auth", "Bearer Token", "Basic Auth", "API Key", "OAuth 2.0"])
         self.auth_type_combo.setFixedWidth(180)
         type_row.addWidget(self.auth_type_combo)
         type_row.addStretch()
@@ -2418,8 +2676,109 @@ class CurlProMainWindow(QMainWindow):
         apikey_layout.addStretch()
         self.auth_stack.addWidget(apikey_page)
 
+        # 4: OAuth 2.0
+        self.auth_stack.addWidget(self._create_oauth2_page())
+
         auth_layout.addWidget(self.auth_stack)
         return auth_widget
+
+    def _create_oauth2_page(self):
+        """Build the OAuth 2.0 auth page (Client Credentials / Authorization Code+PKCE)."""
+        self._oauth2_tokens = {
+            "access_token": None, "refresh_token": None,
+            "expires_at": None, "token_type": "Bearer",
+        }
+        self._oauth2_callback_server = None
+        self._oauth2_pending = None  # {"state", "verifier"} while an auth-code flow is in flight
+
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        form_container = QWidget()
+        layout = QFormLayout(form_container)
+        layout.setContentsMargins(16, 12, 16, 16)
+        layout.setHorizontalSpacing(18)
+        layout.setVerticalSpacing(10)
+        layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        scroll.setWidget(form_container)
+        page_layout.addWidget(scroll)
+
+        self.oauth2_grant_combo = QComboBox()
+        self.oauth2_grant_combo.addItems(["Client Credentials", "Authorization Code (PKCE)"])
+        self.oauth2_grant_combo.currentTextChanged.connect(self._oauth2_on_grant_changed)
+        layout.addRow("Grant type", self.oauth2_grant_combo)
+
+        self.oauth2_authcode_fields = QWidget()
+        authcode_layout = QVBoxLayout(self.oauth2_authcode_fields)
+        authcode_layout.setContentsMargins(0, 0, 0, 0)
+        self.oauth2_auth_url = QLineEdit()
+        self.oauth2_auth_url.setPlaceholderText("https://auth.example.com/authorize")
+        authcode_layout.addWidget(QLabel("Authorization URL"))
+        authcode_layout.addWidget(self.oauth2_auth_url)
+        self.oauth2_redirect_uri = QLineEdit("http://localhost:8765/callback")
+        authcode_layout.addWidget(QLabel("Redirect URI (loopback only)"))
+        authcode_layout.addWidget(self.oauth2_redirect_uri)
+        layout.addRow("Authorization", self.oauth2_authcode_fields)
+
+        self.oauth2_token_url = QLineEdit()
+        self.oauth2_token_url.setPlaceholderText("https://auth.example.com/oauth/token")
+        layout.addRow("Access token URL", self.oauth2_token_url)
+
+        self.oauth2_client_id = QLineEdit()
+        self.oauth2_client_id.setPlaceholderText("Client ID (supports {{VARS}})")
+        layout.addRow("Client ID", self.oauth2_client_id)
+
+        self.oauth2_client_secret = QLineEdit()
+        self.oauth2_client_secret.setEchoMode(QLineEdit.EchoMode.Password)
+        self.oauth2_client_secret.setPlaceholderText("Client Secret (supports {{VARS}})")
+        self.oauth2_secret_show = QPushButton("Show Secret")
+        self.oauth2_secret_show.setCheckable(True)
+        self.oauth2_secret_show.setFixedHeight(28)
+        self.oauth2_secret_show.toggled.connect(
+            lambda checked: self.oauth2_client_secret.setEchoMode(
+                QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+            )
+        )
+        secret_row = QWidget()
+        secret_layout = QHBoxLayout(secret_row)
+        secret_layout.setContentsMargins(0, 0, 0, 0)
+        secret_layout.setSpacing(8)
+        secret_layout.addWidget(self.oauth2_client_secret, 1)
+        secret_layout.addWidget(self.oauth2_secret_show)
+        layout.addRow("Client secret", secret_row)
+
+        self.oauth2_scope = QLineEdit()
+        self.oauth2_scope.setPlaceholderText("space-separated scopes (optional)")
+        layout.addRow("Scope", self.oauth2_scope)
+
+        self.oauth2_creds_location = QComboBox()
+        self.oauth2_creds_location.addItems(["Basic Auth Header", "Request Body"])
+        layout.addRow("Send credentials as", self.oauth2_creds_location)
+
+        action_row = QHBoxLayout()
+        self.oauth2_get_token_btn = QPushButton("Get New Access Token")
+        self.oauth2_get_token_btn.setFixedHeight(32)
+        self.oauth2_get_token_btn.clicked.connect(self._oauth2_get_token_clicked)
+        action_row.addWidget(self.oauth2_get_token_btn)
+        self.oauth2_clear_token_btn = QPushButton("Clear Token")
+        self.oauth2_clear_token_btn.setFixedHeight(32)
+        self.oauth2_clear_token_btn.clicked.connect(self._oauth2_clear_token)
+        action_row.addWidget(self.oauth2_clear_token_btn)
+        action_row.addStretch()
+        layout.addRow("", action_row)
+
+        self.oauth2_status_label = QLabel("No token")
+        self.oauth2_status_label.setStyleSheet("color: #888;")
+        layout.addRow("Token status", self.oauth2_status_label)
+        self._oauth2_on_grant_changed(self.oauth2_grant_combo.currentText())
+        return page
+
+    def _oauth2_on_grant_changed(self, text):
+        self.oauth2_authcode_fields.setVisible(text == "Authorization Code (PKCE)")
 
     def get_auth_config(self) -> dict:
         """Return the current auth tab state as a serializable dict."""
@@ -2434,6 +2793,18 @@ class CurlProMainWindow(QMainWindow):
             cfg["key"] = self.auth_apikey_key.text()
             cfg["value"] = self.auth_apikey_value.text()
             cfg["add_to"] = self.auth_apikey_addto.currentText()
+        elif t == "OAuth 2.0":
+            cfg["oauth2"] = {
+                "grant_type": self.oauth2_grant_combo.currentText(),
+                "auth_url": self.oauth2_auth_url.text(),
+                "token_url": self.oauth2_token_url.text(),
+                "client_id": self.oauth2_client_id.text(),
+                "client_secret": self.oauth2_client_secret.text(),
+                "scope": self.oauth2_scope.text(),
+                "redirect_uri": self.oauth2_redirect_uri.text(),
+                "auth_in_body": self.oauth2_creds_location.currentText() == "Request Body",
+                **self._oauth2_tokens,
+            }
         return cfg
 
     def set_auth_config(self, cfg: dict):
@@ -2446,6 +2817,24 @@ class CurlProMainWindow(QMainWindow):
         self.auth_apikey_key.setText(cfg.get("key", ""))
         self.auth_apikey_value.setText(cfg.get("value", ""))
         self.auth_apikey_addto.setCurrentText(cfg.get("add_to", "Header"))
+        o = cfg.get("oauth2") or {}
+        self.oauth2_grant_combo.setCurrentText(o.get("grant_type", "Client Credentials"))
+        self.oauth2_auth_url.setText(o.get("auth_url", ""))
+        self.oauth2_token_url.setText(o.get("token_url", ""))
+        self.oauth2_client_id.setText(o.get("client_id", ""))
+        self.oauth2_client_secret.setText(o.get("client_secret", ""))
+        self.oauth2_scope.setText(o.get("scope", ""))
+        self.oauth2_redirect_uri.setText(o.get("redirect_uri") or "http://localhost:8765/callback")
+        self.oauth2_creds_location.setCurrentText(
+            "Request Body" if o.get("auth_in_body") else "Basic Auth Header"
+        )
+        self._oauth2_tokens = {
+            "access_token": o.get("access_token"),
+            "refresh_token": o.get("refresh_token"),
+            "expires_at": o.get("expires_at"),
+            "token_type": o.get("token_type", "Bearer"),
+        }
+        self._oauth2_refresh_status_label()
 
     def apply_auth(self, headers: dict, params: dict, env: dict):
         """Apply the configured auth to headers/params (mutated in place), resolving env vars.
@@ -2474,7 +2863,208 @@ class CurlProMainWindow(QMainWindow):
                         params[key] = value
                 else:
                     headers[key] = value
+        elif t == "OAuth 2.0":
+            headers["Authorization"] = self._oauth2_bearer_header(cfg.get("oauth2") or {}, env)
         return None
+
+    def _oauth2_bearer_header(self, o: dict, env: dict) -> str:
+        """Return a usable 'Bearer <token>' header for the OAuth2 auth type,
+        refreshing synchronously if the current token is expired. Raises
+        OAuth2TokenMissing if the user needs to run the interactive flow."""
+        token = o.get("access_token")
+        expires_at = o.get("expires_at")
+        skew = 30
+        if token and (expires_at is None or time.time() < expires_at - skew):
+            return f"{o.get('token_type') or 'Bearer'} {token}"
+
+        refresh_token = o.get("refresh_token")
+        if refresh_token:
+            token_url = apply_env(o.get("token_url", ""), env)
+            client_id = apply_env(o.get("client_id", ""), env)
+            client_secret = apply_env(o.get("client_secret", ""), env)
+            try:
+                result = oauth2_request_token(
+                    token_url, "refresh_token",
+                    client_id=client_id, client_secret=client_secret,
+                    refresh_token=refresh_token, auth_in_body=bool(o.get("auth_in_body")),
+                    verify_ssl=self.verify_ssl_check.isChecked(),
+                )
+            except Exception as e:
+                raise OAuth2TokenMissing(
+                    f"OAuth 2.0 token expired and refresh failed: {e}. "
+                    "Click \"Get New Access Token\" in the Auth tab."
+                ) from e
+            self._apply_oauth2_token_result(result, keep_refresh_token=refresh_token)
+            return f"{self._oauth2_tokens.get('token_type') or 'Bearer'} {self._oauth2_tokens['access_token']}"
+
+        raise OAuth2TokenMissing(
+            "No OAuth 2.0 access token yet. Click \"Get New Access Token\" in the Auth tab."
+        )
+
+    def _apply_oauth2_token_result(self, token_json, keep_refresh_token=None):
+        expires_in = token_json.get("expires_in")
+        expires_at = (time.time() + float(expires_in)) if expires_in is not None else None
+        self._oauth2_tokens = {
+            "access_token": token_json.get("access_token"),
+            "refresh_token": token_json.get("refresh_token") or keep_refresh_token,
+            "expires_at": expires_at,
+            "token_type": token_json.get("token_type", "Bearer"),
+        }
+        self._oauth2_refresh_status_label()
+
+    def _oauth2_refresh_status_label(self):
+        if not hasattr(self, "oauth2_status_label"):
+            return
+        token = self._oauth2_tokens.get("access_token")
+        expires_at = self._oauth2_tokens.get("expires_at")
+        if not token:
+            self.oauth2_status_label.setText("No token")
+            self.oauth2_status_label.setStyleSheet("color: #888;")
+        elif expires_at is not None and time.time() >= expires_at:
+            self.oauth2_status_label.setText('Token expired — click "Get New Access Token"')
+            self.oauth2_status_label.setStyleSheet("color: #dc3545;")
+        elif expires_at is not None:
+            remaining = max(0, int(expires_at - time.time()))
+            mins, secs = divmod(remaining, 60)
+            self.oauth2_status_label.setText(f"Token active — expires in {mins}m {secs}s")
+            self.oauth2_status_label.setStyleSheet("color: #28a745;")
+        else:
+            self.oauth2_status_label.setText("Token active (no expiry reported)")
+            self.oauth2_status_label.setStyleSheet("color: #28a745;")
+
+    def _oauth2_clear_token(self):
+        self._oauth2_tokens = {
+            "access_token": None, "refresh_token": None,
+            "expires_at": None, "token_type": "Bearer",
+        }
+        self._oauth2_refresh_status_label()
+        self.status_bar.showMessage("OAuth 2.0 token cleared")
+
+    def _oauth2_get_token_clicked(self):
+        server = self._oauth2_callback_server
+        if server is not None and server.isRunning():
+            server.stop()
+            self._oauth2_callback_server = None
+            self._oauth2_pending = None
+            self.oauth2_get_token_btn.setText("Get New Access Token")
+            self.oauth2_status_label.setText("Cancelled")
+            self.oauth2_status_label.setStyleSheet("color: #888;")
+            return
+        self._start_oauth2_flow()
+
+    def _start_oauth2_flow(self):
+        env_name = self.env_combo.currentText()
+        env = self.envs.get(env_name, {})
+        grant = self.oauth2_grant_combo.currentText()
+        token_url = apply_env(self.oauth2_token_url.text().strip(), env)
+        client_id = apply_env(self.oauth2_client_id.text().strip(), env)
+        client_secret = apply_env(self.oauth2_client_secret.text(), env)
+        scope = apply_env(self.oauth2_scope.text().strip(), env)
+        auth_in_body = self.oauth2_creds_location.currentText() == "Request Body"
+
+        if not token_url:
+            QMessageBox.warning(self, "OAuth 2.0", "Enter an Access Token URL first.")
+            return
+
+        if grant == "Client Credentials":
+            self.oauth2_status_label.setText("Requesting token…")
+            self.oauth2_status_label.setStyleSheet("color: #0d6efd;")
+            thread = _OAuth2TokenThread({
+                "token_url": token_url, "grant_type": "client_credentials",
+                "client_id": client_id, "client_secret": client_secret,
+                "scope": scope, "auth_in_body": auth_in_body,
+                "verify_ssl": self.verify_ssl_check.isChecked(),
+            })
+            self._oauth2_token_thread = thread
+            thread.finished.connect(self._on_oauth2_token_ready)
+            thread.error.connect(self._on_oauth2_token_error)
+            thread.start()
+            return
+
+        # Authorization Code + PKCE
+        auth_url = apply_env(self.oauth2_auth_url.text().strip(), env)
+        redirect_uri = apply_env(self.oauth2_redirect_uri.text().strip(), env)
+        if not auth_url or not redirect_uri:
+            QMessageBox.warning(
+                self, "OAuth 2.0",
+                "Enter both an Authorization URL and a Redirect URI."
+            )
+            return
+        parsed = urlparse(redirect_uri)
+        if parsed.hostname not in ("localhost", "127.0.0.1"):
+            QMessageBox.warning(
+                self, "OAuth 2.0",
+                "Redirect URI must be a loopback address (localhost/127.0.0.1) — "
+                "CurlPro starts a temporary local server to catch the callback."
+            )
+            return
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path = parsed.path or "/"
+
+        verifier, challenge = _pkce_pair()
+        state = secrets.token_urlsafe(24)
+        self._oauth2_pending = {
+            "verifier": verifier, "state": state, "token_url": token_url,
+            "client_id": client_id, "client_secret": client_secret,
+            "redirect_uri": redirect_uri, "auth_in_body": auth_in_body,
+        }
+
+        server = _OAuth2CallbackServer(parsed.hostname, port, path)
+        self._oauth2_callback_server = server
+        server.code_received.connect(self._on_oauth2_code_received)
+        server.error.connect(self._on_oauth2_code_error)
+        server.finished.connect(lambda: setattr(self, "_oauth2_callback_server", None))
+        server.start()
+
+        authorize_url = build_authorization_url(
+            auth_url, client_id=client_id, redirect_uri=redirect_uri,
+            state=state, code_challenge=challenge, scope=scope,
+        )
+        webbrowser.open(authorize_url)
+        self.oauth2_get_token_btn.setText("Cancel — waiting for browser…")
+        self.oauth2_status_label.setText(f"Waiting for browser authorization on port {port}…")
+        self.oauth2_status_label.setStyleSheet("color: #0d6efd;")
+
+    def _on_oauth2_code_received(self, code, state):
+        self.oauth2_get_token_btn.setText("Get New Access Token")
+        pending = self._oauth2_pending
+        self._oauth2_pending = None
+        if not pending or state != pending["state"]:
+            QMessageBox.critical(
+                self, "OAuth 2.0",
+                "State mismatch in authorization redirect — aborting for safety."
+            )
+            self.oauth2_status_label.setText("Failed — state mismatch")
+            self.oauth2_status_label.setStyleSheet("color: #dc3545;")
+            return
+        self.oauth2_status_label.setText("Exchanging code for token…")
+        self.oauth2_status_label.setStyleSheet("color: #0d6efd;")
+        thread = _OAuth2TokenThread({
+            "token_url": pending["token_url"], "grant_type": "authorization_code",
+            "client_id": pending["client_id"], "client_secret": pending["client_secret"],
+            "code": code, "redirect_uri": pending["redirect_uri"],
+            "code_verifier": pending["verifier"], "auth_in_body": pending["auth_in_body"],
+            "verify_ssl": self.verify_ssl_check.isChecked(),
+        })
+        self._oauth2_token_thread = thread
+        thread.finished.connect(self._on_oauth2_token_ready)
+        thread.error.connect(self._on_oauth2_token_error)
+        thread.start()
+
+    def _on_oauth2_code_error(self, message):
+        self.oauth2_get_token_btn.setText("Get New Access Token")
+        self._oauth2_pending = None
+        self.oauth2_status_label.setText(f"Failed: {message}")
+        self.oauth2_status_label.setStyleSheet("color: #dc3545;")
+
+    def _on_oauth2_token_ready(self, token_json):
+        self._apply_oauth2_token_result(token_json)
+        self.status_bar.showMessage("OAuth 2.0 access token acquired")
+
+    def _on_oauth2_token_error(self, message):
+        self.oauth2_status_label.setText(f"Failed: {message}")
+        self.oauth2_status_label.setStyleSheet("color: #dc3545;")
+        QMessageBox.critical(self, "OAuth 2.0 Error", message)
 
     def _save_response_body_bytes(self):
         if not self._last_response:
@@ -2802,11 +3392,33 @@ class CurlProMainWindow(QMainWindow):
 
     def apply_theme(self):
         if self.settings.get("theme") == "dark":
-            self.setStyleSheet("QMainWindow { background-color: #2b2b2b; color: #ffffff; }")
+            self.setStyleSheet("""
+                QMainWindow { background-color: #202020; color: #f2f2f2; }
+                QGroupBox {
+                    border: 1px solid #474747; border-radius: 7px;
+                    margin-top: 12px; padding: 14px 10px 10px 10px;
+                    font-weight: 600;
+                }
+                QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+                QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+                    min-height: 34px; padding: 0 10px; border: 1px solid #4a4a4a;
+                    border-radius: 6px; background: #2b2b2b; color: #f4f4f4;
+                }
+                QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+                    border: 1px solid #2f8cff;
+                }
+                QPushButton { min-height: 32px; padding: 0 12px; }
+                QPushButton#send_btn { background-color: #28a745; min-width: 100px; }
+                QLabel#formHint { color: #a9a9a9; font-weight: normal; }
+                QScrollArea { background: transparent; }
+            """)
         else:
             self.setStyleSheet("""
                 QGroupBox { border: 2px solid #ddd; border-radius: 5px; margin-top: 10px; padding-top: 10px; font-weight: bold; }
+                QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { min-height: 34px; padding: 0 8px; }
+                QPushButton { min-height: 32px; padding: 0 12px; }
                 QPushButton#send_btn { background-color: #28a745; min-width: 100px; }
+                QLabel#formHint { color: #666; font-weight: normal; }
             """)
         font = self.font()
         font.setPointSize(self.settings.get("font_size", 10))
@@ -3235,13 +3847,19 @@ class CurlProMainWindow(QMainWindow):
             self.body_text.setPlaceholderText("key=value&other=one  (for text fields)\nUse Attachments below for files.")
         elif text == "Binary":
             self.body_text.setPlaceholderText("(Binary payload - use Save/Load to manipulate file)")
+        elif text == "GraphQL":
+            self.body_text.setPlaceholderText(
+                'query GetUser($id: ID!) {\n  user(id: $id) {\n    id\n    name\n  }\n}'
+            )
         else:
             self.body_text.setPlaceholderText('{\n  "key": "value",\n  "user": "{{USERNAME}}"\n}')
 
         # show attachments only for Form Data
-        show_attachments = (text == "Form Data")
         if hasattr(self, "attachments_group"):
-            self.attachments_group.setVisible(show_attachments)
+            self.attachments_group.setVisible(text == "Form Data")
+        # show variables/operation-name panel only for GraphQL
+        if hasattr(self, "graphql_group"):
+            self.graphql_group.setVisible(text == "GraphQL")
 
     def _update_method_color(self, *_args):
         """Tint the method dropdown so the request type is obvious at a glance."""
@@ -3375,6 +3993,46 @@ class CurlProMainWindow(QMainWindow):
         self._update_method_color()
         return True
 
+    def _graphql_snapshot(self) -> dict:
+        """Serializable copy of the GraphQL variables/operation-name panel."""
+        if not hasattr(self, "graphql_variables_text"):
+            return {}
+        return {
+            "graphql_variables": self.graphql_variables_text.toPlainText(),
+            "graphql_operation_name": self.graphql_operation_name.text(),
+        }
+
+    def _restore_graphql(self, data: dict):
+        data = data or {}
+        if hasattr(self, "graphql_variables_text"):
+            self.graphql_variables_text.setPlainText(data.get("graphql_variables", ""))
+        if hasattr(self, "graphql_operation_name"):
+            self.graphql_operation_name.setText(data.get("graphql_operation_name", ""))
+
+    def _resolve_graphql_payload(self, env: dict) -> dict:
+        """Build the {query, variables, operationName?} JSON body for a
+        GraphQL body-type request. Query lives in body_text, variables/
+        operation name in the dedicated GraphQL panel widgets.
+
+        Raises ValueError (with a message fit for a QMessageBox) if the
+        query is empty or the variables aren't valid JSON.
+        """
+        query = apply_env(self.body_text.toPlainText().strip(), env)
+        if not query:
+            raise ValueError("Enter a GraphQL query.")
+        vars_text = apply_env(self.graphql_variables_text.toPlainText().strip(), env)
+        variables = {}
+        if vars_text:
+            try:
+                variables = json.loads(vars_text)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"GraphQL variables: invalid JSON — {e}") from e
+        payload = {"query": query, "variables": variables}
+        op_name = apply_env(self.graphql_operation_name.text().strip(), env)
+        if op_name:
+            payload["operationName"] = op_name
+        return payload
+
     def send_request(self):
         if looks_like_curl(self.url_input.text()):
             if not self.import_curl(self.url_input.text()):
@@ -3409,7 +4067,16 @@ class CurlProMainWindow(QMainWindow):
         content_type = headers.get("Content-Type", "").lower()
         body_type = self.body_type_combo.currentText()
 
-        if body_type == "JSON" or "application/json" in content_type or (body_raw and body_raw.startswith(("{", "["))):
+        if body_type == "GraphQL":
+            try:
+                json_body = self._resolve_graphql_payload(env)
+            except ValueError as e:
+                QMessageBox.warning(self, "GraphQL", str(e))
+                return
+            if "Content-Type" not in headers:
+                headers["Content-Type"] = "application/json"
+
+        elif body_type == "JSON" or "application/json" in content_type or (body_raw and body_raw.startswith(("{", "["))):
             if body_raw:
                 try:
                     json_body = json.loads(body_raw)
@@ -3457,7 +4124,11 @@ class CurlProMainWindow(QMainWindow):
 
         # Apply query params and authentication (auth mutates headers/params).
         params = self._resolved_params(env)
-        auth_tuple = self.apply_auth(headers, params, env)
+        try:
+            auth_tuple = self.apply_auth(headers, params, env)
+        except OAuth2TokenMissing as e:
+            QMessageBox.warning(self, "OAuth 2.0", str(e))
+            return
         advanced = self._advanced_snapshot()
 
         # Snapshot current UI inputs so history is accurate if the user edits
@@ -3472,6 +4143,7 @@ class CurlProMainWindow(QMainWindow):
             'advanced': dict(advanced),
             'attachments': self._attachments_snapshot(),
             'output_file': self._pending_output_file,
+            **self._graphql_snapshot(),
         }
 
         req_id = self._req_counter
@@ -3546,6 +4218,8 @@ class CurlProMainWindow(QMainWindow):
                 "advanced": snapshot.get('advanced', self._advanced_snapshot()),
                 "attachments": snapshot.get('attachments', self._attachments_snapshot()),
                 "output_file": snapshot.get('output_file'),
+                "graphql_variables": snapshot.get('graphql_variables', self._graphql_snapshot().get('graphql_variables', '')),
+                "graphql_operation_name": snapshot.get('graphql_operation_name', self._graphql_snapshot().get('graphql_operation_name', '')),
             }
             entry["_id"] = add_history(entry)
             self.history.append(entry)
@@ -3603,6 +4277,8 @@ class CurlProMainWindow(QMainWindow):
                 "advanced": snapshot.get('advanced', self._advanced_snapshot()),
                 "attachments": snapshot.get('attachments', self._attachments_snapshot()),
                 "output_file": snapshot.get('output_file'),
+                "graphql_variables": snapshot.get('graphql_variables', self._graphql_snapshot().get('graphql_variables', '')),
+                "graphql_operation_name": snapshot.get('graphql_operation_name', self._graphql_snapshot().get('graphql_operation_name', '')),
             }
             entry["_id"] = add_history(entry)
             self.history.append(entry)
@@ -3631,6 +4307,7 @@ class CurlProMainWindow(QMainWindow):
             "advanced": self._advanced_snapshot(),
             "attachments": self._attachments_snapshot(),
             "output_file": self._pending_output_file,
+            **self._graphql_snapshot(),
         }
         coll.append(req)
         save_document("collections", self.collections)
@@ -3652,6 +4329,7 @@ class CurlProMainWindow(QMainWindow):
             "advanced": self._advanced_snapshot(),
             "attachments": self._attachments_snapshot(),
             "output_file": self._pending_output_file,
+            **self._graphql_snapshot(),
         }
         try:
             Path(fname).write_text(json.dumps(req, indent=2))
@@ -3671,6 +4349,7 @@ class CurlProMainWindow(QMainWindow):
             self._restore_params(data.get("params", []))
             self.body_type_combo.setCurrentText(data.get("body_type", "Raw"))
             self.body_text.setPlainText(data.get("body", ""))
+            self._restore_graphql(data)
             self.restore_attachments(data.get("attachments", []))
             self.set_auth_config(data.get("auth", {}))
             self._restore_advanced(data.get("advanced", {}))
@@ -3714,6 +4393,7 @@ class CurlProMainWindow(QMainWindow):
                 self._restore_params(req.get("params", []))
                 self.body_type_combo.setCurrentText(req.get("body_type", "Raw"))
                 self.body_text.setPlainText(req.get("body", ""))
+                self._restore_graphql(req)
                 self.restore_attachments(req.get("attachments", []))
                 self.set_auth_config(req.get("auth", {}))
                 self._restore_advanced(req.get("advanced", {}))
@@ -3749,6 +4429,7 @@ class CurlProMainWindow(QMainWindow):
         if data.get("body_type"):
             self.body_type_combo.setCurrentText(data.get("body_type"))
         self.body_text.setPlainText(data.get("request_body", ""))
+        self._restore_graphql(data)
 
         # Restore attachments (multipart/form-data files)
         self.restore_attachments(data.get("attachments", []))
@@ -3945,7 +4626,12 @@ class CurlProMainWindow(QMainWindow):
             if line and ":" in line:
                 key, value = line.split(":", 1)
                 headers[key.strip()] = apply_env(value.strip(), env)
-        body_raw = apply_env(self.body_text.toPlainText().strip(), env)
+        if self.body_type_combo.currentText() == "GraphQL":
+            body_raw = json.dumps(self._resolve_graphql_payload(env))
+            if "Content-Type" not in headers:
+                headers["Content-Type"] = "application/json"
+        else:
+            body_raw = apply_env(self.body_text.toPlainText().strip(), env)
 
         # Fold query params and authentication into the snippet's URL/headers.
         params = self._resolved_params(env)
@@ -4419,7 +5105,15 @@ class CurlProMainWindow(QMainWindow):
         body_type = self.body_type_combo.currentText()
         content_type = headers.get("Content-Type", "").lower()
 
-        if body_type == "JSON" or "application/json" in content_type or (body_raw and body_raw.startswith(("{", "["))):
+        if body_type == "GraphQL":
+            try:
+                json_body = self._resolve_graphql_payload(env)
+            except ValueError as e:
+                QMessageBox.warning(self, "GraphQL", str(e))
+                return
+            if "Content-Type" not in headers:
+                headers["Content-Type"] = "application/json"
+        elif body_type == "JSON" or "application/json" in content_type or (body_raw and body_raw.startswith(("{", "["))):
             if body_raw:
                 try:
                     json_body = json.loads(body_raw)
@@ -4436,7 +5130,11 @@ class CurlProMainWindow(QMainWindow):
             data = body_raw.encode("utf-8")
 
         params = self._resolved_params(env)
-        auth_tuple = self.apply_auth(headers, params, env)
+        try:
+            auth_tuple = self.apply_auth(headers, params, env)
+        except OAuth2TokenMissing as e:
+            QMessageBox.warning(self, "OAuth 2.0", str(e))
+            return
         advanced = self._advanced_snapshot()
 
         config = {
