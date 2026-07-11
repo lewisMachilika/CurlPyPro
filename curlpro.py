@@ -19,6 +19,8 @@ import datetime as _dt
 from pathlib import Path
 import shlex
 import base64
+from html.parser import HTMLParser
+from xml.dom import minidom
 from urllib.parse import unquote, urlparse, urlencode, parse_qsl, urlunparse
 import requests
 from requests.adapters import HTTPAdapter
@@ -34,10 +36,84 @@ from PyQt6.QtWidgets import (
     QGroupBox, QDialog, QDialogButtonBox, QProgressBar, QStatusBar,
     QToolButton, QMenu, QPlainTextEdit, QStackedWidget,
     QTableWidget, QTableWidgetItem, QHeaderView, QSpinBox, QDoubleSpinBox,
-    QCheckBox, QWidgetAction
+    QCheckBox, QWidgetAction, QTextBrowser
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl
 from PyQt6.QtGui import QClipboard, QColor, QShortcut, QKeySequence, QFont, QPixmap
+try:
+    from PyQt6.QtWebEngineCore import QWebEngineSettings
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+except ImportError:  # Keep CurlPro usable when the optional preview engine is absent.
+    QWebEngineSettings = None
+    QWebEngineView = None
+
+
+class _HTMLPrettyPrinter(HTMLParser):
+    """Create a readable representation of HTML without changing the response."""
+
+    VOID_ELEMENTS = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr",
+    }
+
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.lines = []
+        self.depth = 0
+
+    def _add(self, value):
+        value = value.strip()
+        if value:
+            self.lines.append(f"{'  ' * self.depth}{value}")
+
+    def handle_decl(self, decl):
+        self._add(f"<!{decl}>")
+
+    def handle_starttag(self, tag, attrs):
+        self._add(self.get_starttag_text())
+        if tag.lower() not in self.VOID_ELEMENTS:
+            self.depth += 1
+
+    def handle_startendtag(self, tag, attrs):
+        self._add(self.get_starttag_text())
+
+    def handle_endtag(self, tag):
+        self.depth = max(0, self.depth - 1)
+        self._add(f"</{tag}>")
+
+    def handle_data(self, data):
+        for line in data.splitlines():
+            self._add(line)
+
+    def handle_entityref(self, name):
+        self._add(f"&{name};")
+
+    def handle_charref(self, name):
+        self._add(f"&#{name};")
+
+    def handle_comment(self, data):
+        self._add(f"<!--{data.strip()}-->")
+
+    def handle_pi(self, data):
+        self._add(f"<?{data}>")
+
+
+def _pretty_html(value):
+    parser = _HTMLPrettyPrinter()
+    try:
+        parser.feed(value)
+        parser.close()
+        return "\n".join(parser.lines) or value
+    except Exception:
+        return value
+
+
+def _pretty_xml(value):
+    try:
+        parsed = minidom.parseString(value)
+        return parsed.toprettyxml(indent="  ")
+    except Exception:
+        return value
 
 # ---------------------------
 # Storage (SQLite, single file in the data dir)
@@ -2102,7 +2178,22 @@ class CurlProMainWindow(QMainWindow):
         self.response_preview_scroll = QScrollArea()
         self.response_preview_scroll.setWidget(self.response_preview_label)
         self.response_preview_scroll.setWidgetResizable(True)
-        self.response_tabs.addTab(self.response_preview_scroll, "Preview")
+
+        if QWebEngineView is not None:
+            self.response_preview_html = QWebEngineView()
+            settings = self.response_preview_html.settings()
+            settings.setAttribute(
+                QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, False
+            )
+        else:
+            self.response_preview_html = QTextBrowser()
+            self.response_preview_html.setOpenExternalLinks(True)
+            self.response_preview_html.setReadOnly(True)
+
+        self.response_preview_stack = QStackedWidget()
+        self.response_preview_stack.addWidget(self.response_preview_scroll)
+        self.response_preview_stack.addWidget(self.response_preview_html)
+        self.response_tabs.addTab(self.response_preview_stack, "Preview")
 
         response_layout.addWidget(self.response_tabs)
         # Download toolbar
@@ -3030,10 +3121,21 @@ class CurlProMainWindow(QMainWindow):
         self.response_raw.setPlainText(raw_text)
 
         content_type = response.headers.get("Content-Type", "").lower()
+        stripped_text = raw_text.lstrip()
+        is_html = (
+            "text/html" in content_type
+            or "application/xhtml+xml" in content_type
+            or stripped_text.lower().startswith(("<!doctype html", "<html"))
+        )
+        is_xml = (
+            not is_html
+            and ("xml" in content_type or stripped_text.startswith("<?xml"))
+        )
         image_types = ["image/png", "image/jpeg", "image/jpg", "image/webp",
                        "image/gif", "image/bmp", "image/tiff"]
 
         if any(x in content_type for x in image_types):
+            self.response_preview_stack.setCurrentWidget(self.response_preview_scroll)
             pixmap = QPixmap()
             pixmap.loadFromData(response.content)
             if not pixmap.isNull():
@@ -3042,11 +3144,21 @@ class CurlProMainWindow(QMainWindow):
                 scaled = pixmap.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatio,
                                        Qt.TransformationMode.SmoothTransformation)
                 self.response_preview_label.setPixmap(scaled)
-                self.response_tabs.setCurrentWidget(self.response_preview_scroll)
+                self.response_tabs.setCurrentWidget(self.response_preview_stack)
             else:
                 self.response_preview_label.clear()
                 self.response_preview_label.setText("Could not decode image")
+        elif is_html:
+            # The web engine handles modern HTML/CSS/JS and resolves relative assets.
+            # QTextBrowser remains a dependency-free fallback for existing installs.
+            if QWebEngineView is not None:
+                self.response_preview_html.setHtml(raw_text, QUrl(response.url))
+            else:
+                self.response_preview_html.document().setBaseUrl(QUrl(response.url))
+                self.response_preview_html.setHtml(raw_text)
+            self.response_preview_stack.setCurrentWidget(self.response_preview_html)
         else:
+            self.response_preview_stack.setCurrentWidget(self.response_preview_scroll)
             self.response_preview_label.clear()
             self.response_preview_label.setText("No preview available")
 
@@ -3058,7 +3170,7 @@ class CurlProMainWindow(QMainWindow):
                 f"Use 'Save Response Body…' to save this file.\n"
                 f"Suggested extension: {ext}"
             )
-        elif "application/json" in content_type or raw_text.strip().startswith(("{", "[")):
+        elif "application/json" in content_type or stripped_text.startswith(("{", "[")):
             try:
                 if self.settings.get("auto_format_json", True):
                     self.response_pretty.setPlainText(json.dumps(response.json(), indent=2))
@@ -3066,6 +3178,10 @@ class CurlProMainWindow(QMainWindow):
                     self.response_pretty.setPlainText(raw_text)
             except Exception:
                 self.response_pretty.setPlainText(raw_text)
+        elif is_html:
+            self.response_pretty.setPlainText(_pretty_html(raw_text))
+        elif is_xml:
+            self.response_pretty.setPlainText(_pretty_xml(raw_text))
         else:
             self.response_pretty.setPlainText(raw_text)
 
