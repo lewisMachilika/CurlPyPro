@@ -38,7 +38,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QDialog, QDialogButtonBox, QProgressBar, QStatusBar,
     QToolButton, QMenu, QPlainTextEdit, QStackedWidget,
     QTableWidget, QTableWidgetItem, QHeaderView, QSpinBox, QDoubleSpinBox,
-    QCheckBox, QWidgetAction, QTextBrowser
+    QCheckBox, QWidgetAction, QTextBrowser, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl
 from PyQt6.QtGui import QClipboard, QColor, QShortcut, QKeySequence, QFont, QPixmap
@@ -2096,7 +2096,12 @@ class RequestPanel(QWidget):
 
     # ---------- UI ----------
     def init_ui(self):
+        # The vertical splitter must own the available viewport directly.
+        # Putting it inside a QScrollArea lets its children's size hints grow
+        # the whole page, which is why an empty Params table consumed nearly
+        # all the visible height and pushed the Response section below it.
         right_layout = QVBoxLayout(self)
+        right_layout.setContentsMargins(0, 0, 0, 0)
 
         # --- Request group ---
         request_group = QGroupBox("Request")
@@ -2237,14 +2242,13 @@ class RequestPanel(QWidget):
         self.request_tabs.addTab(self.create_scripts_tab(), "Scripts")
 
         request_layout.addWidget(self.request_tabs)
-        right_layout.addWidget(request_group, 1)
+        right_layout.addWidget(request_group)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         right_layout.addWidget(self.progress_bar)
 
         active_group = QGroupBox("Active Requests")
-        active_group.setMaximumHeight(155)
         active_layout_inner = QVBoxLayout(active_group)
         active_layout_inner.setContentsMargins(4, 4, 4, 4)
         self.active_requests_table = QTableWidget(0, 5)
@@ -2330,7 +2334,21 @@ class RequestPanel(QWidget):
         download_toolbar.addStretch()
         response_layout.addLayout(download_toolbar)
 
-        right_layout.addWidget(response_group, 1)
+        right_layout.addWidget(response_group)
+
+        # Let the user decide how much vertical room each section needs.  The
+        # old stretch/fixed-height combination made an empty Params table fill
+        # most of the window and kept Active Requests permanently cramped.
+        content_splitter = QSplitter(Qt.Orientation.Vertical)
+        for section in (request_group, active_group, response_group):
+            right_layout.removeWidget(section)
+            content_splitter.addWidget(section)
+        content_splitter.setChildrenCollapsible(False)
+        content_splitter.setStretchFactor(0, 2)
+        content_splitter.setStretchFactor(1, 1)
+        content_splitter.setStretchFactor(2, 2)
+        content_splitter.setSizes([360, 170, 360])
+        right_layout.insertWidget(0, content_splitter, 1)
 
     # ---------- Params ----------
     def create_params_tab(self):
@@ -2364,6 +2382,11 @@ class RequestPanel(QWidget):
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.params_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.params_table.setAlternatingRowColors(True)
+        # Cap the table's growth like the Headers tab's QTextEdit; otherwise
+        # an empty/short table stretches to fill whatever height the Request
+        # splitter section has, dwarfing Active Requests and Response below it.
+        self.params_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.params_table.setMaximumHeight(160)
         layout.addWidget(self.params_table)
 
         return params_widget
@@ -4704,7 +4727,7 @@ class CurlProMainWindow(QMainWindow):
         self.collections_tree.itemDoubleClicked.connect(self.load_collection_item)
         collections_layout.addWidget(self.collections_tree)
 
-        left_layout.addWidget(collections_group, 2)
+        left_layout.addWidget(collections_group)
 
         # History
         history_group = QGroupBox("Request History")
@@ -4761,7 +4784,20 @@ class CurlProMainWindow(QMainWindow):
         del_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
         del_shortcut.activated.connect(self.delete_selected_history)
 
-        left_layout.addWidget(history_group, 1)
+        left_layout.addWidget(history_group)
+
+        # Collections and history share a movable boundary instead of fixed
+        # layout proportions, so either tree can grow when its content matters.
+        sidebar_splitter = QSplitter(Qt.Orientation.Vertical)
+        left_layout.removeWidget(collections_group)
+        left_layout.removeWidget(history_group)
+        sidebar_splitter.addWidget(collections_group)
+        sidebar_splitter.addWidget(history_group)
+        sidebar_splitter.setChildrenCollapsible(False)
+        sidebar_splitter.setStretchFactor(0, 1)
+        sidebar_splitter.setStretchFactor(1, 1)
+        sidebar_splitter.setSizes([430, 430])
+        left_layout.addWidget(sidebar_splitter, 1)
 
         self.reload_collections()
         self.reload_history()
