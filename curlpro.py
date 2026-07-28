@@ -2249,6 +2249,8 @@ class RequestPanel(QWidget):
         right_layout.addWidget(self.progress_bar)
 
         active_group = QGroupBox("Active Requests")
+        active_group.setMinimumHeight(90)
+        active_group.setMaximumHeight(140)
         active_layout_inner = QVBoxLayout(active_group)
         active_layout_inner.setContentsMargins(4, 4, 4, 4)
         self.active_requests_table = QTableWidget(0, 5)
@@ -2267,6 +2269,7 @@ class RequestPanel(QWidget):
         right_layout.addWidget(active_group)
 
         response_group = QGroupBox("Response")
+        response_group.setMinimumHeight(220)
         response_layout = QVBoxLayout(response_group)
 
         self.response_summary = QLabel("Ready to send request...")
@@ -2274,6 +2277,9 @@ class RequestPanel(QWidget):
         response_layout.addWidget(self.response_summary)
 
         self.response_tabs = QTabWidget()
+        self.response_tabs.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
 
         self.response_pretty = QTextEdit()
         self.response_pretty.setReadOnly(True)
@@ -2290,6 +2296,20 @@ class RequestPanel(QWidget):
         self.response_insights = QTextEdit()
         self.response_insights.setReadOnly(True)
         self.response_tabs.addTab(self.response_insights, "Insights")
+
+        # API payloads commonly contain long tokens/base64 values.  Wrapping
+        # keeps those lines inside the response viewport instead of making the
+        # whole request panel appear to overflow horizontally.
+        for editor in (
+            self.response_pretty,
+            self.response_raw,
+            self.response_headers,
+            self.response_insights,
+        ):
+            editor.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+            editor.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
 
         self.response_preview_label = QLabel("No preview available")
         self.response_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2344,10 +2364,18 @@ class RequestPanel(QWidget):
             right_layout.removeWidget(section)
             content_splitter.addWidget(section)
         content_splitter.setChildrenCollapsible(False)
-        content_splitter.setStretchFactor(0, 2)
-        content_splitter.setStretchFactor(1, 1)
-        content_splitter.setStretchFactor(2, 2)
-        content_splitter.setSizes([360, 170, 360])
+        # Request controls should stay compact.  Without a maximum, QSplitter
+        # gives the tab widget most of the extra window height and pushes the
+        # actual response below the visible area.
+        request_group.setMinimumHeight(250)
+        request_group.setMaximumHeight(380)
+        content_splitter.setStretchFactor(0, 0)
+        content_splitter.setStretchFactor(1, 0)
+        content_splitter.setStretchFactor(2, 1)
+        # Results are the primary output.  Give them the largest initial share
+        # while retaining enough room to edit a request and inspect the queue.
+        content_splitter.setSizes([300, 110, 500])
+        self.content_splitter = content_splitter
         right_layout.insertWidget(0, content_splitter, 1)
 
     # ---------- Params ----------
@@ -3417,10 +3445,21 @@ class RequestPanel(QWidget):
         ])
 
     def _refresh_progress(self):
-        running = sum(1 for s in self._request_store.values() if s['thread'].isRunning())
-        self.progress_bar.setVisible(running > 0)
+        # The worker emits its result just before QThread.isRunning() becomes
+        # false, so using isRunning() here can leave the busy indicator visible
+        # forever after the final request.  Track the logical request state
+        # instead.
+        running = sum(
+            1 for store in self._request_store.values()
+            if store.get('running', False)
+        )
         if running > 0:
             self.progress_bar.setRange(0, 0)
+            self.progress_bar.setVisible(True)
+        else:
+            self.progress_bar.setVisible(False)
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
 
     def _update_active_table(self):
         self.active_requests_table.setRowCount(0)
@@ -3560,6 +3599,20 @@ class RequestPanel(QWidget):
             self.response_pretty.setPlainText(_pretty_xml(raw_text))
         else:
             self.response_pretty.setPlainText(raw_text)
+
+        # QTextEdit may preserve the old scroll offsets across setPlainText().
+        # Always reveal the beginning of a newly loaded result.
+        for editor in (
+            self.response_pretty,
+            self.response_raw,
+            self.response_headers,
+            self.response_insights,
+        ):
+            editor.moveCursor(editor.textCursor().MoveOperation.Start)
+            editor.ensureCursorVisible()
+            editor.horizontalScrollBar().setValue(0)
+
+        self.response_tabs.setCurrentWidget(self.response_pretty)
 
     # ---------- Attachments ----------
     def add_attachment_file(self):
@@ -3876,6 +3929,7 @@ class RequestPanel(QWidget):
             'result': None,
             'error': None,
             'elapsed': None,
+            'running': True,
         }
         thread.finished.connect(lambda result, rid=req_id: self.on_request_finished(result, rid))
         thread.error.connect(lambda err, rid=req_id: self.on_request_error(err, rid))
@@ -3888,6 +3942,7 @@ class RequestPanel(QWidget):
     def on_request_finished(self, result, req_id):
         store = self._request_store.get(req_id, {})
         if store:
+            store['running'] = False
             store['result'] = result
             store['elapsed'] = result['elapsed'] * 1000
 
@@ -3949,6 +4004,7 @@ class RequestPanel(QWidget):
     def on_request_error(self, error_message, req_id):
         store = self._request_store.get(req_id, {})
         if store:
+            store['running'] = False
             store['error'] = error_message
             store['elapsed'] = 0
 
