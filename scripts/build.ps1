@@ -1,4 +1,4 @@
-# Build CurlPro into a single-file Windows executable.
+# Build CurlPyPro into a single-file Windows executable.
 # Usage (from project root):  ./scripts/build.ps1
 $ErrorActionPreference = "Stop"
 
@@ -18,4 +18,4 @@ Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
 Write-Host "==> Building with PyInstaller" -ForegroundColor Cyan
 & $py -m PyInstaller curlpro.spec --noconfirm
 
-Write-Host "`nDone. Executable: dist\CurlPro.exe" -ForegroundColor Green
+Write-Host "`nDone. Executable: dist\CurlPyPro.exe" -ForegroundColor Green

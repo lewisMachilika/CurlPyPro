@@ -1,16 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec for CurlPro — single-file build, works on Windows, macOS and Linux.
+PyInstaller spec for CurlPyPro — single-file build, works on Windows, macOS and Linux.
 
 Build with:
     pyinstaller curlpro.spec
 
-Output: dist/CurlPro (single self-contained executable, .exe on Windows).
+Output: dist/CurlPyPro (single self-contained executable, .exe on Windows).
 """
 import sys
 from pathlib import Path
 
-APP_NAME = "CurlPro"
+APP_NAME = "CurlPyPro"
 
 # Optional icon: drop an icon next to this spec and it gets picked up automatically.
 #   Windows -> assets/icon.ico   macOS -> assets/icon.icns   Linux -> none needed
@@ -64,10 +64,10 @@ if sys.platform == "darwin":
         exe,
         name=f"{APP_NAME}.app",
         icon=icon_file,
-        bundle_identifier="com.curlpro.app",
+        bundle_identifier="com.curlpypro.app",
         info_plist={
-            "CFBundleName": "CurlPro",
-            "CFBundleDisplayName": "CurlPro",
+            "CFBundleName": "CurlPyPro",
+            "CFBundleDisplayName": "CurlPyPro",
             "NSHighResolutionCapable": True,
         },
     )

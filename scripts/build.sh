@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build CurlPro into a single-file executable on macOS or Linux.
+# Build CurlPyPro into a single-file executable on macOS or Linux.
 # Usage (from project root):  ./scripts/build.sh
 set -euo pipefail
 
@@ -21,7 +21,7 @@ echo "==> Building with PyInstaller"
 
 echo ""
 if [ "$(uname)" = "Darwin" ]; then
-  echo "Done. App bundle: dist/CurlPro.app  (single executable: dist/CurlPro)"
+  echo "Done. App bundle: dist/CurlPyPro.app  (single executable: dist/CurlPyPro)"
 else
-  echo "Done. Executable: dist/CurlPro"
+  echo "Done. Executable: dist/CurlPyPro"
 fi

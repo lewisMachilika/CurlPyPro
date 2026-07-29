@@ -1,6 +1,6 @@
 name: Build apps
 
-# Builds single-file CurlPro executables for Windows, macOS and Linux.
+# Builds single-file CurlPyPro executables for Windows, macOS and Linux.
 # Runs on every push/PR (artifacts), and attaches binaries to GitHub Releases
 # when you push a tag like v1.0.0.
 on:
@@ -19,14 +19,14 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            artifact: CurlPro-windows
-            path: dist/CurlPro.exe
+            artifact: CurlPyPro-windows
+            path: dist/CurlPyPro.exe
           - os: macos-latest
-            artifact: CurlPro-macos
-            path: dist/CurlPro
+            artifact: CurlPyPro-macos
+            path: dist/CurlPyPro
           - os: ubuntu-latest
-            artifact: CurlPro-linux
-            path: dist/CurlPro
+            artifact: CurlPyPro-linux
+            path: dist/CurlPyPro
 
     steps:
       - uses: actions/checkout@v4

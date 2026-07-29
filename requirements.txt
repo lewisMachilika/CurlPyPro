@@ -1,4 +1,4 @@
-# CurlPro runtime dependencies
+# CurlPyPro runtime dependencies
 # Install with:  pip install -r requirements.txt
 PyQt6>=6.6,<7
 PyQt6-WebEngine>=6.6,<7

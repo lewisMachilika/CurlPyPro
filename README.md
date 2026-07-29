@@ -1,4 +1,4 @@
-# CurlPro
+# CurlPyPro
 
 A lightweight Postman-style API client built with **PyQt6** (GUI) and **requests** (HTTP).
 
@@ -30,15 +30,15 @@ On first run the app creates `~/.curlpro/` storing history, envs, and collection
 
 ## Build a standalone app
 
-CurlPro packages into a single self-contained executable per OS using
+CurlPyPro packages into a single self-contained executable per OS using
 [PyInstaller](https://pyinstaller.org). **Each OS must be built on that OS** —
 PyInstaller cannot cross-compile.
 
 ### Local build
 
-- **Windows:** `./scripts/build.ps1` → produces `dist/CurlPro.exe`
-- **macOS:** `./scripts/build.sh` → produces `dist/CurlPro.app` (and `dist/CurlPro`)
-- **Linux:** `./scripts/build.sh` → produces `dist/CurlPro`
+- **Windows:** `./scripts/build.ps1` → produces `dist/CurlPyPro.exe`
+- **macOS:** `./scripts/build.sh` → produces `dist/CurlPyPro.app` (and `dist/CurlPyPro`)
+- **Linux:** `./scripts/build.sh` → produces `dist/CurlPyPro`
 
 The scripts install build deps (`requirements-dev.txt`), clean previous output,
 and run PyInstaller against `curlpro.spec`.

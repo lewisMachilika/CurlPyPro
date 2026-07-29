@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-curlpro.py - CurlPro with code-snippet generation (curl, python requests, powershell, axios)
+curlpro.py - CurlPyPro with code-snippet generation (curl, python requests, powershell, axios)
 and support for attaching images/files in multipart/form-data.
 
 Requirements:
@@ -45,7 +45,7 @@ from PyQt6.QtGui import QClipboard, QColor, QShortcut, QKeySequence, QFont, QPix
 try:
     from PyQt6.QtWebEngineCore import QWebEngineSettings
     from PyQt6.QtWebEngineWidgets import QWebEngineView
-except ImportError:  # Keep CurlPro usable when the optional preview engine is absent.
+except ImportError:  # Keep CurlPyPro usable when the optional preview engine is absent.
     QWebEngineSettings = None
     QWebEngineView = None
 
@@ -595,7 +595,7 @@ def parse_curl_form_value(value: str):
     """Return (kind, payload) for one curl -F value.
 
     kind is "text" or "file". File payloads are attachment metadata compatible
-    with CurlPro's attachment list.
+    with CurlPyPro's attachment list.
     """
     value = value or ""
     if "=" not in value:
@@ -2073,7 +2073,7 @@ class RequestPanel(QWidget):
     Owns everything about a single request/response pair - method/url/params/
     headers/body/auth/advanced settings/scripts, in-flight request tracking,
     and the response view. Shared state (environments, collections, history,
-    settings, the cookie jar) lives on `main` (the CurlProMainWindow).
+    settings, the cookie jar) lives on `main` (the CurlPyProMainWindow).
     """
 
     def __init__(self, main_window):
@@ -2515,7 +2515,7 @@ class RequestPanel(QWidget):
         self.use_cookie_jar_check = QCheckBox("Use shared cookie jar")
         self.use_cookie_jar_check.setChecked(bool(self.main.settings.get("use_cookie_jar", True)))
         self.use_cookie_jar_check.setToolTip(
-            "Send/store cookies in CurlPro's shared jar (Options menu → Cookies). "
+            "Send/store cookies in CurlPyPro's shared jar (Options menu → Cookies). "
             "Turn off for stateless requests."
         )
 
@@ -3115,7 +3115,7 @@ class RequestPanel(QWidget):
         return {
             "log": {
                 "version": "1.2",
-                "creator": {"name": "CurlPro", "version": "1.0"},
+                "creator": {"name": "CurlPyPro", "version": "1.0"},
                 "pages": [],
                 "entries": [self._har_entry_for_response(resp) for resp in chain],
             }
@@ -3817,7 +3817,7 @@ class RequestPanel(QWidget):
                 QMessageBox.warning(
                     self,
                     "Invalid cURL",
-                    "That looks like a cURL command, but CurlPro couldn't find a URL in it.",
+                    "That looks like a cURL command, but CurlPyPro couldn't find a URL in it.",
                 )
                 return
 
@@ -4690,10 +4690,10 @@ class RequestPanel(QWidget):
 # ---------------------------
 # Main window
 # ---------------------------
-class CurlProMainWindow(QMainWindow):
+class CurlPyProMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CurlPro - With Snippet Generator")
+        self.setWindowTitle("CurlPyPro - With Snippet Generator")
         self.resize(1400, 900)
 
         init_db()
@@ -5290,10 +5290,10 @@ class CurlProMainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("CurlPro")
-    app.setApplicationDisplayName("CurlPro")
-    app.setOrganizationName("CurlPro")
-    win = CurlProMainWindow()
+    app.setApplicationName("CurlPyPro")
+    app.setApplicationDisplayName("CurlPyPro")
+    app.setOrganizationName("CurlPyPro")
+    win = CurlPyProMainWindow()
     win.show()
     sys.exit(app.exec())
 
