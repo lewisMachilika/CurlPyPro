@@ -1,1 +1,0 @@
-.\.venv\Scripts\pythonw.exe curlpro.py

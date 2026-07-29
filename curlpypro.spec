@@ -3,7 +3,7 @@
 PyInstaller spec for CurlPyPro — single-file build, works on Windows, macOS and Linux.
 
 Build with:
-    pyinstaller curlpro.spec
+    pyinstaller curlpypro.spec
 
 Output: dist/CurlPyPro (single self-contained executable, .exe on Windows).
 """
@@ -20,12 +20,20 @@ if sys.platform == "win32" and Path("assets/icon.ico").exists():
 elif sys.platform == "darwin" and Path("assets/icon.icns").exists():
     icon_file = "assets/icon.icns"
 
+runtime_icons = []
+for runtime_icon in (
+    "assets/icon.ico",
+    "assets/icon.icns",
+    "assets/icon-master.png",
+):
+    if Path(runtime_icon).exists():
+        runtime_icons.append((runtime_icon, "assets"))
 
 a = Analysis(
-    ["curlpro.py"],
+    ["curlpypro.py"],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=runtime_icons,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

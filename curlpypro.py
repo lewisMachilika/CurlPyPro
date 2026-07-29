@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-curlpro.py - CurlPyPro with code-snippet generation (curl, python requests, powershell, axios)
+curlpypro.py - CurlPyPro with code-snippet generation (curl, python requests, powershell, axios)
 and support for attaching images/files in multipart/form-data.
 
 Requirements:
     pip install PyQt6 requests
 Run:
-    python curlpro.py
+    python curlpypro.py
 """
 import sys
 import os
@@ -14,6 +14,7 @@ import json
 import time
 import re
 import sqlite3
+import shutil
 import mimetypes
 import datetime as _dt
 from pathlib import Path
@@ -41,7 +42,7 @@ from PyQt6.QtWidgets import (
     QCheckBox, QWidgetAction, QTextBrowser, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl
-from PyQt6.QtGui import QClipboard, QColor, QShortcut, QKeySequence, QFont, QPixmap
+from PyQt6.QtGui import QClipboard, QColor, QShortcut, QKeySequence, QFont, QPixmap, QIcon
 try:
     from PyQt6.QtWebEngineCore import QWebEngineSettings
     from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -120,9 +121,55 @@ def _pretty_xml(value):
 # ---------------------------
 # Storage (SQLite, single file in the data dir)
 # ---------------------------
-DATA_DIR = Path.home() / ".curlpro"
+DATA_DIR = Path.home() / ".curlpypro"
 DATA_DIR.mkdir(exist_ok=True)
-DB_FILE = DATA_DIR / "curlpro.db"
+DB_FILE = DATA_DIR / "curlpypro.db"
+
+# The app used to store its data in ~/.curlpro. Carry that over once, on first
+# run under the new name, so existing history/envs/collections aren't orphaned.
+_OLD_DATA_DIR = Path.home() / ".curlpro"
+
+
+def resource_path(relative_path):
+    """Return an asset path that works from source and from PyInstaller."""
+    bundle_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return bundle_dir / relative_path
+
+
+def app_icon():
+    """Load the platform application icon bundled with the executable."""
+    candidates = (
+        "assets/icon.ico",
+        "assets/icon.icns",
+        "assets/icon-master.png",
+    )
+    for relative_path in candidates:
+        path = resource_path(relative_path)
+        if path.exists():
+            icon = QIcon(str(path))
+            if not icon.isNull():
+                return icon
+    return QIcon()
+
+
+def _migrate_old_data_dir():
+    if DB_FILE.exists() or not _OLD_DATA_DIR.is_dir():
+        return
+    old_db = _OLD_DATA_DIR / "curlpro.db"
+    try:
+        if old_db.exists():
+            shutil.copy2(old_db, DB_FILE)
+        # Legacy JSON files, if the old install never made it to SQLite.
+        for name in ("settings.json", "envs.json", "collections.json", "history.json"):
+            old_json = _OLD_DATA_DIR / name
+            if old_json.exists() and not (DATA_DIR / name).exists():
+                shutil.copy2(old_json, DATA_DIR / name)
+    except Exception:
+        # Never let a failed migration stop the app from starting.
+        pass
+
+
+_migrate_old_data_dir()
 
 def _connect():
     return sqlite3.connect(str(DB_FILE))
@@ -3097,7 +3144,7 @@ class RequestPanel(QWidget):
 
         parsed = urlparse(getattr(self._last_response, "url", "") or self.url_input.text().strip())
         host = (parsed.netloc or "request").replace(":", "_")
-        suggested = f"curlpro-{host}-{time.strftime('%Y%m%d-%H%M%S')}.har"
+        suggested = f"curlpypro-{host}-{time.strftime('%Y%m%d-%H%M%S')}.har"
         fname, _ = QFileDialog.getSaveFileName(
             self, "Export HAR", str(Path.home() / suggested), "HAR Files (*.har);;JSON Files (*.json)"
         )
@@ -4694,6 +4741,7 @@ class CurlPyProMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CurlPyPro - With Snippet Generator")
+        self.setWindowIcon(app_icon())
         self.resize(1400, 900)
 
         init_db()
@@ -5289,10 +5337,21 @@ class CurlPyProMainWindow(QMainWindow):
 
 
 def main():
+    if sys.platform == "win32":
+        # Gives the taskbar/window a stable identity instead of Python's icon.
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "CurlPyPro.CurlPyPro"
+            )
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
     app.setApplicationName("CurlPyPro")
     app.setApplicationDisplayName("CurlPyPro")
     app.setOrganizationName("CurlPyPro")
+    app.setWindowIcon(app_icon())
     win = CurlPyProMainWindow()
     win.show()
     sys.exit(app.exec())

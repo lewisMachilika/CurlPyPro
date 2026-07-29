@@ -18,7 +18,7 @@ Features:
 - Stress testing with concurrency, status/latency summaries, and optional pre-request scripts
 - Raw response saving, base64 extraction, and HAR export
 
-On first run the app creates `~/.curlpro/` storing history, envs, and collections.
+On first run the app creates `~/.curlpypro/` storing history, envs, and collections.
 
 ## Run from source
 
@@ -26,7 +26,7 @@ On first run the app creates `~/.curlpro/` storing history, envs, and collection
    - macOS/Linux: `python3 -m venv .venv && source .venv/bin/activate`
    - Windows: `python -m venv .venv && .venv\Scripts\activate`
 2. Install dependencies: `pip install -r requirements.txt`
-3. Run: `python curlpro.py`
+3. Run: `python curlpypro.py`
 
 ## Build a standalone app
 
@@ -41,13 +41,20 @@ PyInstaller cannot cross-compile.
 - **Linux:** `./scripts/build.sh` → produces `dist/CurlPyPro`
 
 The scripts install build deps (`requirements-dev.txt`), clean previous output,
-and run PyInstaller against `curlpro.spec`.
+and run PyInstaller against `curlpypro.spec`.
+
+On Windows, the build script also creates
+`dist/installer/CurlPyPro-Setup.exe` when
+[Inno Setup 6](https://jrsoftware.org/isinfo.php) is installed. Installing that
+package registers CurlPyPro in the Start Menu, making it available in Windows
+Search, and offers an optional desktop shortcut. The standalone
+`dist/CurlPyPro.exe` remains portable and is not registered with Windows.
 
 You can also build manually:
 
 ```
 pip install -r requirements-dev.txt
-pyinstaller curlpro.spec --noconfirm
+pyinstaller curlpypro.spec --noconfirm
 ```
 
 ### Automated multi-OS builds (CI)
@@ -67,7 +74,7 @@ git push origin v1.0.0
 
 ### App icon (optional)
 
-Drop an icon and it's picked up automatically by `curlpro.spec`:
+Drop an icon and it's picked up automatically by `curlpypro.spec`:
 
 - Windows: `assets/icon.ico`
 - macOS: `assets/icon.icns`

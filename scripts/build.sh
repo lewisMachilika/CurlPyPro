@@ -17,7 +17,7 @@ echo "==> Cleaning previous build"
 rm -rf build dist
 
 echo "==> Building with PyInstaller"
-"$py" -m PyInstaller curlpro.spec --noconfirm
+"$py" -m PyInstaller curlpypro.spec --noconfirm
 
 echo ""
 if [ "$(uname)" = "Darwin" ]; then

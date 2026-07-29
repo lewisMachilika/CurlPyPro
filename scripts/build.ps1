@@ -16,6 +16,26 @@ Write-Host "==> Cleaning previous build" -ForegroundColor Cyan
 Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
 
 Write-Host "==> Building with PyInstaller" -ForegroundColor Cyan
-& $py -m PyInstaller curlpro.spec --noconfirm
+& $py -m PyInstaller curlpypro.spec --noconfirm
 
-Write-Host "`nDone. Executable: dist\CurlPyPro.exe" -ForegroundColor Green
+$isccCandidates = @(
+    @(
+        (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"),
+        (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"),
+        (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe")
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+)
+
+if ($isccCandidates.Count -gt 0) {
+    Write-Host "==> Generating installer wizard images" -ForegroundColor Cyan
+    & $py scripts\make_wizard_images.py
+
+    Write-Host "==> Building Windows installer" -ForegroundColor Cyan
+    & $isccCandidates[0] "installer\windows\CurlPyPro.iss"
+    Write-Host "`nDone. Installer: dist\installer\CurlPyPro-Setup.exe" -ForegroundColor Green
+} else {
+    Write-Warning "Inno Setup 6 was not found; skipping the searchable Windows installer."
+    Write-Host "Install Inno Setup 6, then run this script again to create it." -ForegroundColor Yellow
+}
+
+Write-Host "Portable executable: dist\CurlPyPro.exe" -ForegroundColor Green
