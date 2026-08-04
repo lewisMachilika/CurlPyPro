@@ -25,6 +25,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from html.parser import HTMLParser
 from xml.dom import minidom
 from urllib.parse import unquote, urlparse, urlencode, parse_qsl, parse_qs, urlunparse
+import urllib.request as urllib_request
 import requests
 from requests.adapters import HTTPAdapter
 try:
@@ -388,8 +389,153 @@ def strip_query_from_url(url: str) -> str:
     return urlunparse(parsed._replace(query=""))
 
 
+def detect_system_proxy(sample_url="https://www.example.com/"):
+    """Resolve the proxy Windows itself would use for `sample_url`.
+
+    Browsers get their proxy from WinINET/WinHTTP, which understands PAC
+    (``AutoConfigURL``) and WPAD auto-detect. `requests` understands neither —
+    it only reads http_proxy/https_proxy — which is why a request can succeed in
+    a browser and time out here. This asks WinHTTP the same question the browser
+    asks, so corporate PAC setups resolve to the real proxy.
+
+    Returns (proxy, bypass) as strings, or (None, None) when the system is
+    configured for direct access or we're not on Windows.
+    """
+    if os.name != "nt":
+        # Non-Windows: the env vars are the system config, and requests already
+        # honours them via trust_env.
+        env = urllib_request.getproxies()
+        return env.get("https") or env.get("http") or None, env.get("no") or None
+
+    import ctypes
+    from ctypes import wintypes
+
+    WINHTTP_ACCESS_TYPE_NO_PROXY = 1
+    WINHTTP_AUTOPROXY_AUTO_DETECT = 0x00000001
+    WINHTTP_AUTOPROXY_CONFIG_URL = 0x00000002
+    WINHTTP_AUTO_DETECT_TYPE_DHCP = 0x00000001
+    WINHTTP_AUTO_DETECT_TYPE_DNS_A = 0x00000002
+
+    class AUTOPROXY_OPTIONS(ctypes.Structure):
+        _fields_ = [
+            ("dwFlags", wintypes.DWORD),
+            ("dwAutoDetectFlags", wintypes.DWORD),
+            ("lpszAutoConfigUrl", wintypes.LPCWSTR),
+            ("lpvReserved", ctypes.c_void_p),
+            ("dwReserved", wintypes.DWORD),
+            ("fAutoLogonIfChallenged", wintypes.BOOL),
+        ]
+
+    class PROXY_INFO(ctypes.Structure):
+        _fields_ = [
+            ("dwAccessType", wintypes.DWORD),
+            ("lpszProxy", wintypes.LPWSTR),
+            ("lpszProxyBypass", wintypes.LPWSTR),
+        ]
+
+    class IE_PROXY_CONFIG(ctypes.Structure):
+        _fields_ = [
+            ("fAutoDetect", wintypes.BOOL),
+            ("lpszAutoConfigUrl", wintypes.LPWSTR),
+            ("lpszProxy", wintypes.LPWSTR),
+            ("lpszProxyBypass", wintypes.LPWSTR),
+        ]
+
+    try:
+        winhttp = ctypes.WinDLL("winhttp.dll")
+        winhttp.WinHttpOpen.restype = ctypes.c_void_p
+        winhttp.WinHttpOpen.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.LPCWSTR,
+                                        wintypes.LPCWSTR, wintypes.DWORD]
+        winhttp.WinHttpGetProxyForUrl.restype = wintypes.BOOL
+        winhttp.WinHttpGetProxyForUrl.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR,
+                                                  ctypes.POINTER(AUTOPROXY_OPTIONS),
+                                                  ctypes.POINTER(PROXY_INFO)]
+        winhttp.WinHttpCloseHandle.argtypes = [ctypes.c_void_p]
+        winhttp.WinHttpGetIEProxyConfigForCurrentUser.restype = wintypes.BOOL
+        winhttp.WinHttpGetIEProxyConfigForCurrentUser.argtypes = [ctypes.POINTER(IE_PROXY_CONFIG)]
+
+        ie = IE_PROXY_CONFIG()
+        if not winhttp.WinHttpGetIEProxyConfigForCurrentUser(ctypes.byref(ie)):
+            return None, None
+
+        # A statically configured proxy wins and needs no PAC evaluation.
+        if ie.lpszProxy:
+            return ie.lpszProxy, ie.lpszProxyBypass or None
+
+        if not ie.lpszAutoConfigUrl and not ie.fAutoDetect:
+            return None, None  # genuinely direct
+
+        handle = winhttp.WinHttpOpen("CurlPyPro/proxy-detect", WINHTTP_ACCESS_TYPE_NO_PROXY,
+                                     None, None, 0)
+        if not handle:
+            return None, None
+        try:
+            opts = AUTOPROXY_OPTIONS()
+            if ie.lpszAutoConfigUrl:
+                opts.dwFlags = WINHTTP_AUTOPROXY_CONFIG_URL
+                opts.lpszAutoConfigUrl = ie.lpszAutoConfigUrl
+            else:
+                opts.dwFlags = WINHTTP_AUTOPROXY_AUTO_DETECT
+                opts.dwAutoDetectFlags = (WINHTTP_AUTO_DETECT_TYPE_DHCP |
+                                          WINHTTP_AUTO_DETECT_TYPE_DNS_A)
+            opts.fAutoLogonIfChallenged = True
+
+            info = PROXY_INFO()
+            if not winhttp.WinHttpGetProxyForUrl(handle, sample_url, ctypes.byref(opts),
+                                                 ctypes.byref(info)):
+                return None, None
+            return (info.lpszProxy or None), (info.lpszProxyBypass or None)
+        finally:
+            winhttp.WinHttpCloseHandle(handle)
+    except Exception:
+        return None, None
+
+
+def normalize_proxy_url(proxy):
+    """Accept `host:port`, `http://host:port`, or a PAC-style `PROXY host:port`.
+
+    WinHTTP hands back bare `host:port` (and sometimes a semicolon-separated
+    list); requests needs a full URL, so default the scheme to http.
+    """
+    proxy = (proxy or "").strip()
+    if not proxy:
+        return ""
+    # PAC/WinHTTP can return a fallback list ("PROXY a:80; DIRECT") — take the
+    # first entry and drop the PAC keyword, which is not part of the host.
+    first = re.split(r"[;,]", proxy)[0].strip()
+    m = re.match(r"^(PROXY|HTTP|HTTPS|SOCKS5?)\s+(.+)$", first, re.IGNORECASE)
+    if m:
+        keyword, first = m.group(1).upper(), m.group(2).strip()
+        if "://" not in first:
+            # PAC "HTTPS host" means TLS to the proxy itself, not to the target.
+            scheme = {"SOCKS": "socks4", "SOCKS5": "socks5", "HTTPS": "https"}.get(keyword)
+            if scheme:
+                first = f"{scheme}://{first}"
+    first = re.split(r"\s+", first)[0].strip()
+    if not first or first.upper() == "DIRECT":
+        return ""
+    if "://" not in first:
+        first = "http://" + first
+    return first
+
+
+def build_proxies(proxy, bypass=None):
+    """Turn a proxy string into the mapping requests expects, or None."""
+    proxy = normalize_proxy_url(proxy)
+    if not proxy:
+        return None
+    proxies = {"http": proxy, "https": proxy}
+    bypass = (bypass or "").strip()
+    if bypass:
+        # WinHTTP separates bypass entries with ';', requests' no_proxy uses ','.
+        proxies["no_proxy"] = ",".join(
+            p for p in re.split(r"[;,\s]+", bypass) if p and p != "<local>"
+        )
+    return proxies
+
+
 def make_retry_session(retry_total=0, retry_backoff=0.0, retry_statuses=None, max_redirects=30,
-                        cookie_jar=None):
+                        cookie_jar=None, proxies=None):
     """Return a requests session configured with optional urllib3 retries.
 
     Passing a shared `cookie_jar` makes the session read/write into it, so
@@ -399,6 +545,10 @@ def make_retry_session(retry_total=0, retry_backoff=0.0, retry_statuses=None, ma
     session = requests.Session()
     if cookie_jar is not None:
         session.cookies = cookie_jar
+    if proxies:
+        # Explicit config beats the http_proxy/https_proxy env vars requests
+        # would otherwise pick up via trust_env.
+        session.proxies.update(proxies)
     try:
         session.max_redirects = max(1, int(max_redirects or 30))
     except Exception:
@@ -836,7 +986,7 @@ class RequestThread(QThread):
         self, method, url, headers, json_body, data, files=None, timeout=30,
         params=None, auth=None, allow_redirects=True, verify_ssl=True,
         max_redirects=30, retry_total=0, retry_backoff=0.0,
-        retry_statuses=None, cookie_jar=None,
+        retry_statuses=None, cookie_jar=None, proxies=None,
     ):
         super().__init__()
         self.method = method
@@ -855,6 +1005,7 @@ class RequestThread(QThread):
         self.retry_backoff = retry_backoff
         self.retry_statuses = retry_statuses or []
         self.cookie_jar = cookie_jar  # shared RequestsCookieJar, or None to stay stateless
+        self.proxies = proxies        # {'http': ..., 'https': ...} or None to use env/direct
 
     # def run(self):
     #     try:
@@ -882,6 +1033,7 @@ class RequestThread(QThread):
                 self.retry_total, self.retry_backoff,
                 self.retry_statuses, self.max_redirects,
                 cookie_jar=self.cookie_jar,
+                proxies=self.proxies,
             )
             t0 = time.time()
             resp = session.request(
@@ -1054,6 +1206,7 @@ class StressTestWorker(QThread):
                 cfg.get('retry_statuses') or [],
                 cfg.get('max_redirects', 30),
                 cookie_jar=cfg.get('cookie_jar'),
+                proxies=cfg.get('proxies'),
             )
             resp = session.request(
                 cfg['method'], cfg['url'],
@@ -2575,10 +2728,39 @@ class RequestPanel(QWidget):
         max_redirects_row.addWidget(self.max_redirects_spin)
         max_redirects_row.addStretch()
 
+        proxy_row = QHBoxLayout()
+        proxy_row.addWidget(QLabel("Proxy:"))
+        self.proxy_input = QLineEdit()
+        self.proxy_input.setPlaceholderText("http://127.0.0.1:8080  (blank = direct / http_proxy env var)")
+        self.proxy_input.setText(str(self.main.settings.get("proxy", "")))
+        self.proxy_input.setToolTip(
+            "Route requests through an HTTP proxy, e.g. a corporate gateway.\n"
+            "Leave blank to connect directly (the http_proxy/https_proxy environment\n"
+            "variables are still honoured when this is empty).\n\n"
+            "If a URL loads in your browser but times out here, your machine is almost\n"
+            "certainly using a PAC/auto-config proxy — click Detect to read it."
+        )
+        proxy_row.addWidget(self.proxy_input, 1)
+        self.proxy_detect_btn = QPushButton("Detect")
+        self.proxy_detect_btn.setToolTip("Ask Windows which proxy it would use (understands PAC and WPAD).")
+        self.proxy_detect_btn.clicked.connect(self._detect_proxy)
+        self.proxy_detect_btn.setFixedWidth(80)
+        proxy_row.addWidget(self.proxy_detect_btn)
+
+        proxy_bypass_row = QHBoxLayout()
+        proxy_bypass_row.addWidget(QLabel("Proxy bypass:"))
+        self.proxy_bypass_input = QLineEdit()
+        self.proxy_bypass_input.setPlaceholderText("localhost,127.0.0.1,*.internal.corp")
+        self.proxy_bypass_input.setText(str(self.main.settings.get("proxy_bypass", "")))
+        self.proxy_bypass_input.setToolTip("Comma-separated hosts that should skip the proxy.")
+        proxy_bypass_row.addWidget(self.proxy_bypass_input, 1)
+
         transport_layout.addWidget(self.follow_redirects_check)
         transport_layout.addWidget(self.verify_ssl_check)
         transport_layout.addWidget(self.use_cookie_jar_check)
         transport_layout.addLayout(max_redirects_row)
+        transport_layout.addLayout(proxy_row)
+        transport_layout.addLayout(proxy_bypass_row)
         layout.addWidget(transport_group)
 
         retry_group = QGroupBox("Retries")
@@ -2616,6 +2798,42 @@ class RequestPanel(QWidget):
         layout.addStretch()
         return advanced_widget
 
+    def _detect_proxy(self):
+        # PAC files can return different proxies per destination, so ask about the
+        # URL actually being sent when there is one.
+        sample = apply_env(self.url_input.text().strip(), self.main.get_active_env())
+        if not sample.lower().startswith(("http://", "https://")):
+            sample = "https://www.example.com/"
+
+        proxy, bypass = detect_system_proxy(sample)
+        if not proxy:
+            QMessageBox.information(
+                self, "No proxy detected",
+                "Windows reports direct access for this URL — no proxy needed.\n\n"
+                "If requests still time out, the block is elsewhere (firewall, VPN, "
+                "or the host is genuinely unreachable).",
+            )
+            return
+
+        self.proxy_input.setText(normalize_proxy_url(proxy))
+        if bypass:
+            self.proxy_bypass_input.setText(
+                ",".join(p for p in re.split(r"[;,\s]+", bypass) if p and p != "<local>")
+            )
+        QMessageBox.information(
+            self, "Proxy detected",
+            f"Using the same proxy your browser would for:\n{sample}\n\n{normalize_proxy_url(proxy)}",
+        )
+
+    def _resolved_proxies(self, env):
+        """Proxy mapping for this request, or None to leave requests on its default."""
+        if not hasattr(self, "proxy_input"):
+            return None
+        return build_proxies(
+            apply_env(self.proxy_input.text().strip(), env),
+            apply_env(self.proxy_bypass_input.text().strip(), env),
+        )
+
     def _advanced_snapshot(self):
         if not hasattr(self, "follow_redirects_check"):
             return {}
@@ -2627,6 +2845,8 @@ class RequestPanel(QWidget):
             "retry_total": self.retry_total_spin.value(),
             "retry_backoff": self.retry_backoff_spin.value(),
             "retry_statuses": self.retry_statuses_input.text().strip(),
+            "proxy": self.proxy_input.text().strip(),
+            "proxy_bypass": self.proxy_bypass_input.text().strip(),
         }
 
     def _restore_advanced(self, cfg):
@@ -2645,6 +2865,10 @@ class RequestPanel(QWidget):
             self.retry_backoff_spin.setValue(float(cfg.get("retry_backoff") or 0))
         if "retry_statuses" in cfg:
             self.retry_statuses_input.setText(str(cfg.get("retry_statuses") or ""))
+        if "proxy" in cfg:
+            self.proxy_input.setText(str(cfg.get("proxy") or ""))
+        if "proxy_bypass" in cfg:
+            self.proxy_bypass_input.setText(str(cfg.get("proxy_bypass") or ""))
 
     # ---------- Auth ----------
     def create_auth_tab(self):
@@ -3968,6 +4192,7 @@ class RequestPanel(QWidget):
             retry_backoff=advanced.get("retry_backoff", 0.0),
             retry_statuses=parse_status_code_list(advanced.get("retry_statuses", "")),
             cookie_jar=cookie_jar,
+            proxies=self._resolved_proxies(env),
         )
         self._request_store[req_id] = {
             'thread': thread,
@@ -4298,6 +4523,11 @@ class RequestPanel(QWidget):
     def generate_curl(self, method, url, headers, body_raw, attachments):
         method = method.upper()
         parts = ["curl.exe", "-i"]
+        proxies = self._resolved_proxies(self.main.get_active_env())
+        if proxies:
+            parts += ["--proxy", shlex.quote(proxies.get("https") or proxies["http"])]
+            if proxies.get("no_proxy"):
+                parts += ["--noproxy", shlex.quote(proxies["no_proxy"])]
         if method != "GET":
             parts += ["-X", method]
         for k, v in self._snippet_headers(headers, drop_content_type=bool(attachments)).items():
@@ -4335,6 +4565,17 @@ class RequestPanel(QWidget):
             lines.append("headers = {}")
         lines.append("")
 
+        proxies = self._resolved_proxies(self.main.get_active_env())
+        proxy_kw = ""
+        if proxies:
+            lines.append("# requests ignores Windows PAC/system proxy settings, so pass it explicitly.")
+            lines.append("proxies = {")
+            for k, v in proxies.items():
+                lines.append(f"    {json.dumps(k)}: {json.dumps(v)},")
+            lines.append("}")
+            lines.append("")
+            proxy_kw = ", proxies=proxies"
+
         if attachments:
             text_fields = self._form_text_fields(body_raw)
             if text_fields:
@@ -4353,7 +4594,7 @@ class RequestPanel(QWidget):
                 )
             lines.append("}")
             lines.append("")
-            lines.append(f"resp = requests.{method.lower()}({json.dumps(url)}, headers=headers, data=data, files=files)")
+            lines.append(f"resp = requests.{method.lower()}({json.dumps(url)}, headers=headers, data=data, files=files{proxy_kw})")
         else:
             body_is_json = False
             parsed_json = None
@@ -4367,13 +4608,13 @@ class RequestPanel(QWidget):
             if body_is_json:
                 lines.append("json_payload = " + json.dumps(parsed_json, indent=4))
                 lines.append("")
-                lines.append(f"resp = requests.{method.lower()}({json.dumps(url)}, headers=headers, json=json_payload)")
+                lines.append(f"resp = requests.{method.lower()}({json.dumps(url)}, headers=headers, json=json_payload{proxy_kw})")
             elif body_raw:
                 lines.append("data = " + json.dumps(body_raw))
                 lines.append("")
-                lines.append(f"resp = requests.{method.lower()}({json.dumps(url)}, headers=headers, data=data)")
+                lines.append(f"resp = requests.{method.lower()}({json.dumps(url)}, headers=headers, data=data{proxy_kw})")
             else:
-                lines.append(f"resp = requests.{method.lower()}({json.dumps(url)}, headers=headers)")
+                lines.append(f"resp = requests.{method.lower()}({json.dumps(url)}, headers=headers{proxy_kw})")
         lines.append("")
         lines.append("print(resp.status_code)")
         lines.append("print(resp.headers)")
@@ -4728,6 +4969,7 @@ class RequestPanel(QWidget):
             'retry_backoff': advanced.get("retry_backoff", 0.0),
             'retry_statuses': parse_status_code_list(advanced.get("retry_statuses", "")),
             'cookie_jar': self.main.cookie_jar if advanced.get("use_cookie_jar", True) else None,
+            'proxies': self._resolved_proxies(env),
         }
 
         dlg = StressTestDialog(config, self)
@@ -4757,6 +4999,8 @@ class CurlPyProMainWindow(QMainWindow):
             "retry_backoff": 0.25,
             "retry_statuses": "429,500,502,503,504",
             "use_cookie_jar": True,
+            "proxy": "",
+            "proxy_bypass": "",
         })
         self.history = load_history()
         self.envs = load_document("envs", {"default": {}})
