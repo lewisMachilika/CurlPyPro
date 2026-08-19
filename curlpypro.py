@@ -2705,6 +2705,10 @@ class RequestPanel(QWidget):
         advanced_widget = QWidget()
         layout = QVBoxLayout(advanced_widget)
 
+        # Keeps the Proxy/Max redirects/Retry labels in one column, wide enough
+        # for the longest of them ("Retry status codes:").
+        label_width = 130
+
         transport_group = QGroupBox("Transport")
         transport_layout = QVBoxLayout(transport_group)
 
@@ -2720,7 +2724,9 @@ class RequestPanel(QWidget):
         )
 
         max_redirects_row = QHBoxLayout()
-        max_redirects_row.addWidget(QLabel("Max redirects:"))
+        max_redirects_label = QLabel("Max redirects:")
+        max_redirects_label.setFixedWidth(label_width)
+        max_redirects_row.addWidget(max_redirects_label)
         self.max_redirects_spin = QSpinBox()
         self.max_redirects_spin.setRange(1, 100)
         self.max_redirects_spin.setValue(int(self.main.settings.get("max_redirects", 30)))
@@ -2729,7 +2735,9 @@ class RequestPanel(QWidget):
         max_redirects_row.addStretch()
 
         proxy_row = QHBoxLayout()
-        proxy_row.addWidget(QLabel("Proxy:"))
+        proxy_label = QLabel("Proxy:")
+        proxy_label.setFixedWidth(label_width)
+        proxy_row.addWidget(proxy_label)
         self.proxy_input = QLineEdit()
         self.proxy_input.setPlaceholderText("http://127.0.0.1:8080  (blank = direct / http_proxy env var)")
         self.proxy_input.setText(str(self.main.settings.get("proxy", "")))
@@ -2748,12 +2756,16 @@ class RequestPanel(QWidget):
         proxy_row.addWidget(self.proxy_detect_btn)
 
         proxy_bypass_row = QHBoxLayout()
-        proxy_bypass_row.addWidget(QLabel("Proxy bypass:"))
+        proxy_bypass_label = QLabel("Proxy bypass:")
+        proxy_bypass_label.setFixedWidth(label_width)
+        proxy_bypass_row.addWidget(proxy_bypass_label)
         self.proxy_bypass_input = QLineEdit()
         self.proxy_bypass_input.setPlaceholderText("localhost,127.0.0.1,*.internal.corp")
         self.proxy_bypass_input.setText(str(self.main.settings.get("proxy_bypass", "")))
         self.proxy_bypass_input.setToolTip("Comma-separated hosts that should skip the proxy.")
         proxy_bypass_row.addWidget(self.proxy_bypass_input, 1)
+        # Line up with the proxy field above, which gives up 80px to Detect.
+        proxy_bypass_row.addSpacing(80 + proxy_row.spacing())
 
         transport_layout.addWidget(self.follow_redirects_check)
         transport_layout.addWidget(self.verify_ssl_check)
@@ -2767,7 +2779,9 @@ class RequestPanel(QWidget):
         retry_layout = QVBoxLayout(retry_group)
 
         retry_row = QHBoxLayout()
-        retry_row.addWidget(QLabel("Retry attempts:"))
+        retry_label = QLabel("Retry attempts:")
+        retry_label.setFixedWidth(label_width)
+        retry_row.addWidget(retry_label)
         self.retry_total_spin = QSpinBox()
         self.retry_total_spin.setRange(0, 10)
         self.retry_total_spin.setValue(int(self.main.settings.get("retry_total", 0)))
@@ -2787,7 +2801,9 @@ class RequestPanel(QWidget):
         retry_layout.addLayout(retry_row)
 
         statuses_row = QHBoxLayout()
-        statuses_row.addWidget(QLabel("Retry status codes:"))
+        statuses_label = QLabel("Retry status codes:")
+        statuses_label.setFixedWidth(label_width)
+        statuses_row.addWidget(statuses_label)
         self.retry_statuses_input = QLineEdit()
         self.retry_statuses_input.setPlaceholderText("429,500,502,503,504")
         self.retry_statuses_input.setText(str(self.main.settings.get("retry_statuses", "429,500,502,503,504")))
@@ -2796,7 +2812,16 @@ class RequestPanel(QWidget):
 
         layout.addWidget(retry_group)
         layout.addStretch()
-        return advanced_widget
+
+        # The Request panel is height-capped, which is not enough for both groups:
+        # without a scroll area Qt squeezes the rows until the proxy fields are
+        # cut in half and Retries falls off the bottom entirely.
+        scroll = QScrollArea()
+        scroll.setWidget(advanced_widget)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        return scroll
 
     def _detect_proxy(self):
         # PAC files can return different proxies per destination, so ask about the
@@ -3046,7 +3071,16 @@ class RequestPanel(QWidget):
         self.oauth_status_label.setStyleSheet("color:#888;")
         oauth_layout.addWidget(self.oauth_status_label)
         oauth_layout.addStretch()
-        return oauth_page
+
+        # OAuth needs far more rows than the other auth types, and the Auth tab
+        # is height-capped: without a scroll area Qt crushes the rows past their
+        # minimums and the labels overlap the fields they belong to.
+        scroll = QScrollArea()
+        scroll.setWidget(oauth_page)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        return scroll
 
     def get_auth_config(self) -> dict:
         """Return the current auth tab state as a serializable dict."""
