@@ -1,0 +1,39 @@
+name: Bug report
+description: Something isn't working as expected
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Describe the bug and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open a new tab
+        2. Set method to POST and URL to ...
+        3. Click Send
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: [Windows, macOS, Linux]
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: CurlPyPro version and how you run it
+      placeholder: "v1.0.0 installer, or from source with Python 3.12"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error output or screenshots
+      description: Remove tokens, passwords and private URLs before pasting.
+      render: text

@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-curlpypro.py - CurlPyPro with code-snippet generation (curl, python requests, powershell, axios)
-and support for attaching images/files in multipart/form-data.
+CurlPyPro - a lightweight, offline-first desktop API client built with PyQt6.
 
-Requirements:
-    pip install PyQt6 requests
+https://github.com/lewisMachilika/CurlPyPro
+Licensed under the MIT License (see LICENSE).
+
 Run:
+    pip install -r requirements.txt
     python curlpypro.py
 """
+__version__ = "1.0.0"
+
 import sys
 import os
 import json
@@ -5629,6 +5632,7 @@ def main():
     app.setApplicationName("CurlPyPro")
     app.setApplicationDisplayName("CurlPyPro")
     app.setOrganizationName("CurlPyPro")
+    app.setApplicationVersion(__version__)
     app.setWindowIcon(app_icon())
     win = CurlPyProMainWindow()
     win.show()
