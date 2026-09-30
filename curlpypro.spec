@@ -10,6 +10,8 @@ Output: dist/CurlPyPro (single self-contained executable, .exe on Windows).
 import sys
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_submodules, copy_metadata
+
 APP_NAME = "CurlPyPro"
 
 # Optional icon: drop an icon next to this spec and it gets picked up automatically.
@@ -33,8 +35,9 @@ a = Analysis(
     ["curlpypro.py"],
     pathex=[],
     binaries=[],
-    datas=runtime_icons,
-    hiddenimports=[],
+    # keyring discovers its OS backends through package metadata at runtime.
+    datas=runtime_icons + copy_metadata("keyring"),
+    hiddenimports=collect_submodules("keyring.backends"),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -17,7 +17,10 @@ get an acknowledgement within 7 days.
 
 ## Scope
 
-CurlPyPro stores request history, environments, cookies and OAuth tokens
+CurlPyPro stores request history, environments, cookies and auth settings
 **unencrypted** in `~/.curlpypro/curlpypro.db` on your machine. Treat that file
-like any other file that contains secrets. Secrets leaking unexpectedly into
+like any other file that contains secrets. Environment variables marked
+**Secret** are the exception: their values are kept in the OS keychain
+(service name `CurlPyPro`) and only an empty placeholder is written to the
+database. Secrets leaking unexpectedly into
 exported files, code snippets, HAR exports, or logs are in scope.

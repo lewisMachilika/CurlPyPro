@@ -24,6 +24,10 @@ from pathlib import Path
 import shlex
 import base64
 import webbrowser
+import difflib
+import html as _html
+import ssl
+import copy
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from html.parser import HTMLParser
 from xml.dom import minidom
@@ -35,6 +39,19 @@ try:
     from urllib3.util import Retry
 except Exception:  # pragma: no cover - depends on requests' vendored stack
     Retry = None
+# Optional extras: each feature degrades gracefully when its package is missing.
+try:
+    import yaml  # OpenAPI / Swagger specs written in YAML
+except ImportError:
+    yaml = None
+try:
+    import websocket  # websocket-client, for the WebSocket console
+except ImportError:
+    websocket = None
+try:
+    import keyring  # OS keychain for secret environment variables
+except ImportError:
+    keyring = None
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit, QComboBox, QListWidget,
@@ -342,6 +359,168 @@ def clear_history_db():
             conn.close()
     except Exception:
         pass
+
+
+# ---------------------------
+# Secret environment variables (OS keychain)
+# ---------------------------
+# Variables marked secret live in the OS keychain (Windows Credential Manager,
+# macOS Keychain, Secret Service on Linux). The database keeps only their
+# names, with an empty placeholder value, so the variable still shows up.
+KEYRING_SERVICE = "CurlPyPro"
+_keyring_written = {}  # (env, var) -> value last written, to skip redundant writes
+
+
+def keyring_available():
+    if keyring is None:
+        return False
+    try:
+        backend = keyring.get_keyring()
+        return getattr(backend, "priority", 1) > 0 and "fail" not in type(backend).__module__
+    except Exception:
+        return False
+
+
+def _secret_account(env_name, var):
+    return f"env:{env_name}:{var}"
+
+
+# Windows Credential Manager rejects values over ~1,280 characters, which long
+# JWTs exceed, so larger values are split across numbered entries.
+_KEYRING_CHUNK = 1000
+_CHUNK_MARKER = "\x00chunks:"
+
+
+def _keyring_set(account, value):
+    value = str(value)
+    old_parts = _keyring_chunk_count(account)
+    if len(value) <= _KEYRING_CHUNK:
+        keyring.set_password(KEYRING_SERVICE, account, value)
+        parts = 0
+    else:
+        chunks = [value[i:i + _KEYRING_CHUNK] for i in range(0, len(value), _KEYRING_CHUNK)]
+        for i, chunk in enumerate(chunks):
+            keyring.set_password(KEYRING_SERVICE, f"{account}#{i}", chunk)
+        keyring.set_password(KEYRING_SERVICE, account, f"{_CHUNK_MARKER}{len(chunks)}")
+        parts = len(chunks)
+    for i in range(parts, old_parts):
+        _keyring_delete_quietly(f"{account}#{i}")
+
+
+def _keyring_chunk_count(account):
+    try:
+        head = keyring.get_password(KEYRING_SERVICE, account)
+    except Exception:
+        return 0
+    if head and head.startswith(_CHUNK_MARKER):
+        try:
+            return int(head[len(_CHUNK_MARKER):])
+        except ValueError:
+            return 0
+    return 0
+
+
+def _keyring_get(account):
+    head = keyring.get_password(KEYRING_SERVICE, account)
+    if head is None or not head.startswith(_CHUNK_MARKER):
+        return head
+    parts = []
+    for i in range(int(head[len(_CHUNK_MARKER):])):
+        part = keyring.get_password(KEYRING_SERVICE, f"{account}#{i}")
+        if part is None:
+            return None
+        parts.append(part)
+    return "".join(parts)
+
+
+def _keyring_delete_quietly(account):
+    try:
+        keyring.delete_password(KEYRING_SERVICE, account)
+    except Exception:
+        pass
+
+
+def _keyring_delete(account):
+    for i in range(_keyring_chunk_count(account)):
+        _keyring_delete_quietly(f"{account}#{i}")
+    _keyring_delete_quietly(account)
+
+
+def load_envs():
+    """Return (envs, secret_names) with secret values filled in from the keychain."""
+    envs = load_document("envs", {"default": {}})
+    secrets = load_document("env_secrets", {})
+    if not isinstance(secrets, dict):
+        secrets = {}
+    use_keyring = keyring_available()
+    for env_name, names in secrets.items():
+        env = envs.get(env_name)
+        if env is None:
+            continue
+        for var in names:
+            value = None
+            if use_keyring:
+                try:
+                    value = _keyring_get(_secret_account(env_name, var))
+                except Exception:
+                    value = None
+            if value is not None:
+                env[var] = value
+                _keyring_written[(env_name, var)] = value
+    return envs, secrets
+
+
+def save_envs(envs, secrets):
+    """Persist envs, moving secret values into the keychain.
+
+    Returns a list of "env/var" names that could not be stored in the keychain;
+    those are removed from `secrets` and saved to the database instead.
+    """
+    failed = []
+    use_keyring = keyring_available()
+    stored = {}
+    clean_secrets = {}
+    for env_name, env_vars in envs.items():
+        wanted = set(secrets.get(env_name, []))
+        out = {}
+        kept = []
+        for var, value in env_vars.items():
+            if var in wanted:
+                if use_keyring:
+                    key = (env_name, var)
+                    try:
+                        if _keyring_written.get(key) != value:
+                            _keyring_set(_secret_account(env_name, var), value)
+                            _keyring_written[key] = value
+                        out[var] = ""
+                        kept.append(var)
+                        continue
+                    except Exception:
+                        pass
+                elif not value:
+                    # Keychain unavailable right now: keep the flag and the
+                    # placeholder rather than forgetting the variable is secret.
+                    out[var] = ""
+                    kept.append(var)
+                    continue
+                failed.append(f"{env_name}/{var}")
+            out[var] = value
+        stored[env_name] = out
+        if kept:
+            clean_secrets[env_name] = kept
+
+    # Remove keychain entries for variables that are no longer secret (or gone).
+    if use_keyring:
+        for (env_name, var) in list(_keyring_written):
+            if var not in clean_secrets.get(env_name, []):
+                _keyring_delete(_secret_account(env_name, var))
+                _keyring_written.pop((env_name, var), None)
+
+    secrets.clear()
+    secrets.update(clean_secrets)
+    save_document("envs", stored)
+    save_document("env_secrets", clean_secrets)
+    return failed
 
 
 placeholder_pattern = re.compile(r"\{\{([A-Za-z0-9_]+)\}\}")
@@ -875,6 +1054,1035 @@ class _ScriptResponse:
             return self._response.json()
         except Exception:
             return None
+
+
+# ---------------------------
+# Request preparation (shared by request tabs, the collection runner and GraphQL tools)
+# ---------------------------
+class RequestBuildError(Exception):
+    """A saved request can't be turned into an HTTP call (bad JSON, missing file...)."""
+
+    def __init__(self, title, message, critical=False):
+        super().__init__(message)
+        self.title = title
+        self.critical = critical
+
+
+def parse_header_lines(text, env):
+    """Parse `Key: Value` lines into a dict, resolving {{VAR}} in values."""
+    headers = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line and ":" in line:
+            key, value = line.split(":", 1)
+            headers[key.strip()] = apply_env(value.strip(), env)
+    return headers
+
+
+def resolve_param_rows(rows, env):
+    """Enabled query-param rows as a list of (key, value), with {{VAR}} resolved."""
+    if isinstance(rows, dict):
+        rows = [{"enabled": True, "key": k, "value": v} for k, v in rows.items()]
+    params = []
+    for row in rows or []:
+        if not isinstance(row, dict) or not row.get("enabled", True):
+            continue
+        key = apply_env(str(row.get("key") or "").strip(), env)
+        if not key:
+            continue
+        params.append((key, apply_env(str(row.get("value") or ""), env)))
+    return params
+
+
+def resolve_auth(cfg, headers, params, env, oauth_token=None):
+    """Apply an auth config to headers/params (mutated in place), resolving env vars.
+
+    `oauth_token(cfg)` supplies a token for OAuth 2.0 configs. Returns a
+    (username, password) tuple for HTTP Basic auth, or None.
+    """
+    cfg = cfg or {}
+    t = cfg.get("type")
+    if t == "Bearer Token":
+        token = apply_env(cfg.get("token", "").strip(), env)
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+    elif t == "Basic Auth":
+        user = apply_env(cfg.get("username", ""), env)
+        pwd = apply_env(cfg.get("password", ""), env)
+        if user or pwd:
+            return (user, pwd)
+    elif t == "API Key":
+        key = apply_env(cfg.get("key", "").strip(), env)
+        value = apply_env(cfg.get("value", ""), env)
+        if key:
+            if cfg.get("add_to") == "Query Params":
+                if hasattr(params, "append"):
+                    params.append((key, value))
+                else:
+                    params[key] = value
+            else:
+                headers[key] = value
+    elif t == "OAuth 2.0" and oauth_token is not None:
+        token = oauth_token(cfg)
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+    return None
+
+
+def build_graphql_payload(query, variables_text, env):
+    """Return the JSON body for a GraphQL request."""
+    payload = {"query": query}
+    variables_text = apply_env((variables_text or "").strip(), env)
+    if variables_text:
+        try:
+            variables = json.loads(variables_text)
+        except json.JSONDecodeError as e:
+            raise RequestBuildError("Invalid GraphQL variables", f"Variables must be a JSON object: {e}")
+        if not isinstance(variables, dict):
+            raise RequestBuildError("Invalid GraphQL variables", "Variables must be a JSON object.")
+        payload["variables"] = variables
+    return payload
+
+
+def close_call_files(files):
+    for item in files or []:
+        try:
+            item[1][1].close()
+        except Exception:
+            pass
+
+
+def prepare_request(req, env, timeout=30, oauth_token=None):
+    """Turn a saved request dict into keyword arguments for `execute_call`.
+
+    Raises RequestBuildError for problems the user must fix (invalid JSON,
+    unreadable attachments, missing URL).
+    """
+    method = (req.get("method") or "GET").upper()
+    url = apply_env((req.get("url") or "").strip(), env)
+    if not url:
+        raise RequestBuildError("Invalid URL", "Please enter a valid URL.")
+
+    headers = parse_header_lines(req.get("headers", ""), env)
+    body_raw = apply_env((req.get("body") or "").strip(), env)
+    body_type = req.get("body_type") or "Raw"
+    json_body = None
+    data = None
+    files = None
+    content_type = headers.get("Content-Type", "").lower()
+
+    if body_type == "GraphQL":
+        # Checked first: a query like `{ users { id } }` would otherwise be
+        # mistaken for a JSON body.
+        json_body = build_graphql_payload(body_raw, req.get("graphql_variables", ""), env)
+        if "Content-Type" not in headers:
+            headers["Content-Type"] = "application/json"
+    elif body_type == "JSON" or "application/json" in content_type or (body_raw and body_raw.startswith(("{", "["))):
+        if body_raw:
+            try:
+                json_body = json.loads(body_raw)
+                if "Content-Type" not in headers:
+                    headers["Content-Type"] = "application/json"
+            except json.JSONDecodeError as e:
+                raise RequestBuildError("Invalid JSON", f"JSON parsing error: {str(e)}")
+    elif body_type == "Form Data":
+        data = {}
+        if body_raw:
+            for pair in body_raw.split("&"):
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                    data[k] = v
+        attachments = req.get("attachments") or []
+        if attachments:
+            files = []
+            for hk in list(headers.keys()):
+                if hk.lower() == "content-type":
+                    del headers[hk]
+            try:
+                for att in attachments:
+                    fp = open(att["path"], "rb")
+                    files.append((att["field"], (att["filename"], fp, att["mime"])))
+            except Exception as e:
+                close_call_files(files)
+                raise RequestBuildError("File Error", f"Failed to open attachment: {e}", critical=True)
+    else:
+        data = body_raw.encode("utf-8") if body_raw else None
+
+    params = resolve_param_rows(req.get("params"), env)
+    auth = resolve_auth(req.get("auth") or {}, headers, params, env, oauth_token)
+    adv = req.get("advanced") or {}
+    return {
+        "method": method,
+        "url": url,
+        "headers": headers,
+        "json_body": json_body,
+        "data": data,
+        "files": files,
+        "params": params or None,
+        "auth": auth,
+        "timeout": timeout,
+        "allow_redirects": adv.get("follow_redirects", True),
+        "verify_ssl": adv.get("verify_ssl", True),
+        "max_redirects": adv.get("max_redirects", 30),
+        "retry_total": adv.get("retry_total", 0),
+        "retry_backoff": adv.get("retry_backoff", 0.0),
+        "retry_statuses": parse_status_code_list(adv.get("retry_statuses", "")),
+        "use_cookie_jar": adv.get("use_cookie_jar", True),
+        "proxies": build_proxies(
+            apply_env((adv.get("proxy") or "").strip(), env),
+            apply_env((adv.get("proxy_bypass") or "").strip(), env),
+        ),
+    }
+
+
+def execute_call(call, cookie_jar=None):
+    """Send a prepared call synchronously. Returns (response, elapsed_seconds)."""
+    session = make_retry_session(
+        call["retry_total"], call["retry_backoff"],
+        call["retry_statuses"], call["max_redirects"],
+        cookie_jar=cookie_jar if call.get("use_cookie_jar", True) else None,
+        proxies=call["proxies"],
+    )
+    try:
+        t0 = time.time()
+        resp = session.request(
+            call["method"], call["url"],
+            headers=call["headers"],
+            json=call["json_body"],
+            data=call["data"],
+            files=call["files"],
+            params=call["params"],
+            auth=call["auth"],
+            allow_redirects=call["allow_redirects"],
+            verify=call["verify_ssl"],
+            timeout=call["timeout"],
+        )
+        return resp, time.time() - t0
+    finally:
+        session.close()
+        close_call_files(call.get("files"))
+
+
+def fetch_oauth2_token(cfg):
+    """Fetch a token for the client-credentials or password grant. Returns (token, expires_in)."""
+    data = {"grant_type": "client_credentials" if cfg.get("grant_type") == "Client Credentials" else "password"}
+    if cfg.get("scope"):
+        data["scope"] = cfg["scope"]
+    if cfg.get("grant_type") == "Password Credentials":
+        data["username"] = cfg.get("username", "")
+        data["password"] = cfg.get("password", "")
+    resp = requests.post(
+        cfg.get("token_url", ""), data=data,
+        auth=(cfg.get("client_id", ""), cfg.get("client_secret", "")),
+        timeout=30,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    return payload["access_token"], int(payload.get("expires_in", 3600))
+
+
+# ---------------------------
+# JSON path, assertions and captures
+# ---------------------------
+_JSON_PATH_TOKEN = re.compile(r"""\.?([^.\[\]]+)|\[\s*(-?\d+)\s*\]|\[\s*['"](.*?)['"]\s*\]""")
+
+
+def json_path_get(data, path):
+    """Look up a simple JSON path such as `$.data.items[0].id`.
+
+    Supports dotted keys, [index] (negative too), ["quoted key"], and a
+    trailing `.length` on lists, objects and strings. Returns (found, value).
+    """
+    path = (path or "").strip()
+    if path.startswith("$"):
+        path = path[1:]
+    value = data
+    pos = 0
+    while pos < len(path):
+        m = _JSON_PATH_TOKEN.match(path, pos)
+        if not m or m.end() == pos:
+            return False, None
+        pos = m.end()
+        key, index, quoted = m.groups()
+        if index is not None:
+            if not isinstance(value, list):
+                return False, None
+            i = int(index)
+            if not -len(value) <= i < len(value):
+                return False, None
+            value = value[i]
+            continue
+        key = quoted if quoted is not None else key.strip()
+        if isinstance(value, dict) and key in value:
+            value = value[key]
+        elif isinstance(value, list) and re.fullmatch(r"-?\d+", key) and -len(value) <= int(key) < len(value):
+            value = value[int(key)]
+        elif key == "length" and isinstance(value, (list, dict, str)):
+            value = len(value)
+        else:
+            return False, None
+    return True, value
+
+
+ASSERTION_SOURCES = ["Status code", "Response time (ms)", "Header", "JSON path", "Body", "Body size (bytes)"]
+ASSERTION_OPERATORS = [
+    "equals", "not equals", "contains", "not contains", "exists", "not exists",
+    "<", "<=", ">", ">=", "matches regex", "one of",
+]
+CAPTURE_SOURCES = ["JSON path", "Header", "Status code", "Body regex"]
+
+
+class _ResponseReader:
+    """Reads values out of a response for assertions and captures, parsing JSON once."""
+
+    _UNPARSED = object()
+
+    def __init__(self, response, elapsed_ms=0):
+        self.response = response
+        self.elapsed_ms = elapsed_ms
+        self._json = self._UNPARSED
+
+    def json(self):
+        if self._json is self._UNPARSED:
+            try:
+                self._json = self.response.json()
+            except Exception:
+                self._json = None
+                return False, None
+        return self._json is not None or self._looks_like_null(), self._json
+
+    def _looks_like_null(self):
+        try:
+            return self.response.text.strip() == "null"
+        except Exception:
+            return False
+
+    def get(self, source, prop):
+        """Return (found, value) for an assertion/capture source."""
+        r = self.response
+        if source == "Status code":
+            return True, r.status_code
+        if source == "Response time (ms)":
+            return True, round(self.elapsed_ms)
+        if source == "Body size (bytes)":
+            return True, len(r.content or b"")
+        if source == "Header":
+            value = r.headers.get(prop)
+            return value is not None, value
+        if source == "Body":
+            return True, r.text
+        if source == "JSON path":
+            ok, data = self.json()
+            if not ok:
+                return False, None
+            return json_path_get(data, prop)
+        if source == "Body regex":
+            try:
+                m = re.search(prop, r.text or "")
+            except re.error:
+                return False, None
+            if not m:
+                return False, None
+            return True, m.group(1) if m.groups() else m.group(0)
+        return False, None
+
+
+def _short_repr(value, limit=120):
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _values_equal(actual, expected_text):
+    if isinstance(actual, str):
+        return actual == expected_text
+    try:
+        expected = json.loads(expected_text)
+    except Exception:
+        return str(actual) == expected_text
+    return actual == expected
+
+
+def _check_operator(op, actual, expected):
+    """Return (passed, reason_if_failed)."""
+    if op == "equals":
+        return _values_equal(actual, expected), None
+    if op == "not equals":
+        return not _values_equal(actual, expected), None
+    if op in ("contains", "not contains"):
+        if isinstance(actual, str):
+            hit = expected in actual
+        elif isinstance(actual, list):
+            try:
+                parsed = json.loads(expected)
+            except Exception:
+                parsed = expected
+            hit = parsed in actual or expected in [str(x) for x in actual]
+        elif isinstance(actual, dict):
+            hit = expected in actual
+        else:
+            hit = expected in str(actual)
+        return (hit if op == "contains" else not hit), None
+    if op in ("<", "<=", ">", ">="):
+        try:
+            a, b = float(actual), float(expected)
+        except (TypeError, ValueError):
+            return False, "not a number"
+        return {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b}[op], None
+    if op == "matches regex":
+        try:
+            return re.search(expected, actual if isinstance(actual, str) else json.dumps(actual)) is not None, None
+        except re.error as e:
+            return False, f"invalid regex: {e}"
+    if op == "one of":
+        return any(_values_equal(actual, part.strip()) for part in expected.split(",")), None
+    return False, f"unknown operator '{op}'"
+
+
+def evaluate_assertions(tests, response, elapsed_ms, env):
+    """Run assertion rows against a response.
+
+    Returns a list of {"name", "passed", "message"} for each enabled row.
+    """
+    reader = _ResponseReader(response, elapsed_ms)
+    results = []
+    for row in tests or []:
+        if not isinstance(row, dict) or not row.get("enabled", True):
+            continue
+        source = row.get("source") or "Status code"
+        prop = apply_env((row.get("property") or "").strip(), env)
+        op = row.get("operator") or "equals"
+        expected = apply_env(str(row.get("expected") or "").strip(), env)
+        label = source + (f" {prop}" if prop and source in ("Header", "JSON path") else "")
+        name = f"{label} {op}" + ("" if op in ("exists", "not exists") else f" {expected}")
+
+        found, actual = reader.get(source, prop)
+        if op == "exists":
+            passed, message = found, None if found else "not found"
+        elif op == "not exists":
+            passed, message = not found, None if not found else f"found: {_short_repr(actual)}"
+        elif not found:
+            passed, message = False, "not found"
+        else:
+            passed, reason = _check_operator(op, actual, expected)
+            message = None if passed else (reason or f"actual: {_short_repr(actual)}")
+        results.append({"name": name, "passed": passed, "message": message or ""})
+    return results
+
+
+def extract_captures(captures, response):
+    """Pull values out of a response into variables.
+
+    Returns (values, problems): values maps variable name -> string value;
+    problems lists human-readable reasons for captures that matched nothing.
+    """
+    reader = _ResponseReader(response)
+    values, problems = {}, []
+    for row in captures or []:
+        if not isinstance(row, dict) or not row.get("enabled", True):
+            continue
+        name = (row.get("variable") or "").strip()
+        if not name:
+            continue
+        source = row.get("source") or "JSON path"
+        expr = (row.get("expression") or "").strip()
+        found, value = reader.get(source, expr)
+        if not found:
+            problems.append(f"{name}: nothing matched {source} '{expr}'")
+            continue
+        values[name] = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    return values, problems
+
+
+# ---------------------------
+# Response diff
+# ---------------------------
+def normalize_for_diff(text, sort_json_keys=True):
+    """Pretty-print JSON so formatting and (optionally) key order don't show up as changes."""
+    try:
+        return json.dumps(json.loads(text), indent=2, sort_keys=sort_json_keys, ensure_ascii=False)
+    except Exception:
+        return text or ""
+
+
+def diff_html(old_text, new_text, old_label, new_label, max_lines=20000):
+    """Return (html, added, removed) for a colored unified diff."""
+    old_lines = old_text.splitlines()[:max_lines]
+    new_lines = new_text.splitlines()[:max_lines]
+    added = removed = 0
+    out = []
+    for line in difflib.unified_diff(old_lines, new_lines, old_label, new_label, lineterm="", n=3):
+        esc = _html.escape(line)
+        if line.startswith("+++") or line.startswith("---"):
+            out.append(f'<span style="color:#888;">{esc}</span>')
+        elif line.startswith("@@"):
+            out.append(f'<span style="color:#6f42c1;">{esc}</span>')
+        elif line.startswith("+"):
+            added += 1
+            out.append(f'<span style="background-color:rgba(40,167,69,0.22);">{esc}</span>')
+        elif line.startswith("-"):
+            removed += 1
+            out.append(f'<span style="background-color:rgba(220,53,69,0.22);">{esc}</span>')
+        else:
+            out.append(esc)
+    body = "\n".join(out)
+    return f'<pre style="font-family:Consolas,Menlo,monospace;">{body}</pre>', added, removed
+
+
+# ---------------------------
+# Importers: Postman collections/environments and OpenAPI/Swagger specs
+# ---------------------------
+def parse_import_text(text):
+    """Parse JSON, or YAML when PyYAML is installed."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as json_error:
+        if yaml is None:
+            raise ValueError(
+                f"Not valid JSON ({json_error}). To import YAML files install PyYAML: pip install PyYAML"
+            )
+        try:
+            return yaml.safe_load(text)
+        except Exception as e:
+            raise ValueError(f"Not valid JSON or YAML: {e}")
+
+
+def detect_import_format(data):
+    if isinstance(data, dict):
+        if "info" in data and "item" in data:
+            return "postman-collection"
+        if isinstance(data.get("values"), list) and ("_postman_variable_scope" in data or "name" in data):
+            return "postman-environment"
+        if "openapi" in data or "swagger" in data:
+            return "openapi"
+    return "curlpypro"
+
+
+def _empty_request(name, method="GET", url=""):
+    return {
+        "name": name, "method": method, "url": url, "headers": "", "params": [],
+        "body_type": "Raw", "body": "", "auth": {"type": "No Auth"}, "advanced": {},
+        "attachments": [], "output_file": None, "scripts": {}, "tests": [], "captures": [],
+        "graphql_variables": "",
+    }
+
+
+def _postman_kv(entries):
+    """Postman stores auth as [{key, value}] (v2.1) or a plain dict (v2.0)."""
+    if isinstance(entries, dict):
+        return entries
+    return {e.get("key"): e.get("value") for e in entries or [] if isinstance(e, dict)}
+
+
+def _postman_auth(auth):
+    if not isinstance(auth, dict):
+        return None
+    t = auth.get("type")
+    kv = _postman_kv(auth.get(t)) if t else {}
+    if t == "noauth":
+        return {"type": "No Auth"}
+    if t == "bearer":
+        return {"type": "Bearer Token", "token": str(kv.get("token", ""))}
+    if t == "basic":
+        return {"type": "Basic Auth", "username": str(kv.get("username", "")), "password": str(kv.get("password", ""))}
+    if t == "apikey":
+        return {
+            "type": "API Key", "key": str(kv.get("key", "")), "value": str(kv.get("value", "")),
+            "add_to": "Query Params" if kv.get("in") == "query" else "Header",
+        }
+    if t == "oauth2":
+        grant = {
+            "client_credentials": "Client Credentials",
+            "password_credentials": "Password Credentials",
+            "authorization_code": "Authorization Code",
+        }.get(kv.get("grant_type"), "Client Credentials")
+        return {
+            "type": "OAuth 2.0", "grant_type": grant,
+            "token_url": str(kv.get("accessTokenUrl", "")), "auth_url": str(kv.get("authUrl", "")),
+            "client_id": str(kv.get("clientId", "")), "client_secret": str(kv.get("clientSecret", "")),
+            "scope": str(kv.get("scope", "")), "redirect_uri": str(kv.get("redirect_uri", "")),
+            "username": str(kv.get("username", "")), "password": str(kv.get("password", "")),
+        }
+    return None
+
+
+def _postman_url(url):
+    """Return (url_without_query, param_rows) for a Postman url (string or object)."""
+    if isinstance(url, str):
+        raw, query = url, None
+        variables = []
+    else:
+        url = url or {}
+        raw = url.get("raw") or ""
+        query = url.get("query")
+        variables = url.get("variable") or []
+        if not raw:
+            host = url.get("host") or []
+            path = url.get("path") or []
+            host = ".".join(host) if isinstance(host, list) else str(host)
+            path = "/".join(path) if isinstance(path, list) else str(path)
+            raw = (f"{url.get('protocol')}://" if url.get("protocol") else "") + host + ("/" + path if path else "")
+
+    base, sep, raw_query = raw.partition("?")
+    if query is None:
+        rows = [{"enabled": True, "key": k, "value": v} for k, v in parse_qsl(raw_query, keep_blank_values=True)]
+    else:
+        rows = [
+            {"enabled": not q.get("disabled", False), "key": str(q.get("key") or ""), "value": str(q.get("value") or "")}
+            for q in query if isinstance(q, dict)
+        ]
+
+    # Postman path variables (/users/:id) become {{id}} unless a value is given.
+    values = {v.get("key"): v.get("value") for v in variables if isinstance(v, dict)}
+
+    def repl(m):
+        name = m.group(1)
+        value = values.get(name)
+        return "/" + (str(value) if value not in (None, "") else "{{" + name + "}}")
+
+    base = re.sub(r"/:([A-Za-z_][A-Za-z0-9_]*)", repl, base)
+    return base, rows
+
+
+def _postman_tests(events):
+    """Translate the simplest Postman test, pm.response.to.have.status(N), into an assertion."""
+    tests = []
+    for ev in events or []:
+        if not isinstance(ev, dict) or ev.get("listen") != "test":
+            continue
+        exec_lines = (ev.get("script") or {}).get("exec") or []
+        code = "\n".join(exec_lines) if isinstance(exec_lines, list) else str(exec_lines)
+        for m in re.finditer(r"pm\.response\.to\.have\.status\(\s*(\d{3})\s*\)", code):
+            tests.append({"enabled": True, "source": "Status code", "property": "",
+                          "operator": "equals", "expected": m.group(1)})
+    return tests
+
+
+def _postman_request(item, name, inherited_auth, warnings):
+    r = item.get("request") or {}
+    if isinstance(r, str):
+        r = {"url": r, "method": "GET"}
+    url, params = _postman_url(r.get("url"))
+    req = _empty_request(name, (r.get("method") or "GET").upper(), url)
+    req["params"] = params
+    req["headers"] = "\n".join(
+        f"{h.get('key')}: {h.get('value', '')}"
+        for h in r.get("header") or []
+        if isinstance(h, dict) and h.get("key") and not h.get("disabled")
+    )
+
+    body = r.get("body") or {}
+    mode = body.get("mode")
+    if mode == "raw":
+        req["body"] = body.get("raw") or ""
+        lang = ((body.get("options") or {}).get("raw") or {}).get("language")
+        req["body_type"] = "JSON" if lang == "json" else "Raw"
+    elif mode == "urlencoded":
+        req["body_type"] = "Form Data"
+        req["body"] = "&".join(
+            f"{p.get('key')}={p.get('value', '')}" for p in body.get("urlencoded") or []
+            if isinstance(p, dict) and not p.get("disabled")
+        )
+    elif mode == "formdata":
+        req["body_type"] = "Form Data"
+        fields = []
+        for p in body.get("formdata") or []:
+            if not isinstance(p, dict) or p.get("disabled"):
+                continue
+            if p.get("type") == "file":
+                src = p.get("src")
+                src = src[0] if isinstance(src, list) and src else src
+                if src:
+                    req["attachments"].append({
+                        "field": p.get("key") or "file", "path": str(src),
+                        "filename": os.path.basename(str(src)),
+                        "mime": mimetypes.guess_type(str(src))[0] or "application/octet-stream",
+                    })
+            else:
+                fields.append(f"{p.get('key')}={p.get('value', '')}")
+        req["body"] = "&".join(fields)
+    elif mode == "graphql":
+        gql = body.get("graphql") or {}
+        req["body_type"] = "GraphQL"
+        req["body"] = gql.get("query") or ""
+        req["graphql_variables"] = gql.get("variables") or ""
+    elif mode:
+        warnings.append(f"{name}: body mode '{mode}' is not supported and was skipped")
+
+    auth = _postman_auth(r.get("auth")) if r.get("auth") else inherited_auth
+    if auth:
+        req["auth"] = auth
+    req["tests"] = _postman_tests(item.get("event"))
+    return req
+
+
+def import_postman_collection(data):
+    """Convert a Postman v2.0/v2.1 collection.
+
+    Returns {"collections": {name: [requests]}, "environments": {name: vars}, "warnings": [...]}.
+    """
+    info = data.get("info") or {}
+    coll_name = info.get("name") or "Postman collection"
+    warnings = []
+    requests_out = []
+
+    def walk(items, prefix, auth):
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name") or "Request"
+            if "item" in item:  # folder
+                folder_auth = _postman_auth(item.get("auth")) if item.get("auth") else auth
+                walk(item["item"], f"{prefix}{name} / ", folder_auth)
+            else:
+                requests_out.append(_postman_request(item, prefix + name, auth, warnings))
+
+    walk(data.get("item"), "", _postman_auth(data.get("auth")))
+
+    envs = {}
+    variables = {
+        str(v.get("key")): "" if v.get("value") is None else str(v.get("value"))
+        for v in data.get("variable") or [] if isinstance(v, dict) and v.get("key")
+    }
+    if variables:
+        envs[coll_name] = variables
+    if any("pm." in json.dumps(i.get("event") or []) for i in data.get("item") or [] if isinstance(i, dict)):
+        warnings.append("Postman JavaScript tests/scripts can't run here; only status-code checks were converted.")
+    return {"collections": {coll_name: requests_out}, "environments": envs, "warnings": warnings}
+
+
+def import_postman_environment(data):
+    name = data.get("name") or "Postman environment"
+    variables = {
+        str(v.get("key")): "" if v.get("value") is None else str(v.get("value"))
+        for v in data.get("values") or []
+        if isinstance(v, dict) and v.get("key") and v.get("enabled", True)
+    }
+    return {"collections": {}, "environments": {name: variables}, "warnings": []}
+
+
+def _resolve_ref(spec, node, seen=None):
+    """Follow local $ref pointers (#/components/...)."""
+    seen = seen or set()
+    while isinstance(node, dict) and "$ref" in node:
+        ref = node["$ref"]
+        if ref in seen or not isinstance(ref, str) or not ref.startswith("#/"):
+            return {}
+        seen.add(ref)
+        target = spec
+        for part in ref[2:].split("/"):
+            part = part.replace("~1", "/").replace("~0", "~")
+            if not isinstance(target, dict) or part not in target:
+                return {}
+            target = target[part]
+        node = target
+    return node
+
+
+def schema_example(spec, schema, depth=0):
+    """Build an example value from a JSON schema (OpenAPI flavour)."""
+    schema = _resolve_ref(spec, schema)
+    if not isinstance(schema, dict) or depth > 6:
+        return None
+    for key in ("example", "default"):
+        if key in schema:
+            return schema[key]
+    if isinstance(schema.get("examples"), list) and schema["examples"]:
+        return schema["examples"][0]
+    if schema.get("enum"):
+        return schema["enum"][0]
+    if "allOf" in schema:
+        merged = {}
+        for part in schema["allOf"]:
+            value = schema_example(spec, part, depth + 1)
+            if isinstance(value, dict):
+                merged.update(value)
+        return merged
+    for key in ("oneOf", "anyOf"):
+        if schema.get(key):
+            return schema_example(spec, schema[key][0], depth + 1)
+
+    t = schema.get("type")
+    if isinstance(t, list):
+        t = next((x for x in t if x != "null"), t[0] if t else None)
+    if t == "object" or (t is None and "properties" in schema):
+        return {
+            name: schema_example(spec, prop, depth + 1)
+            for name, prop in (schema.get("properties") or {}).items()
+        }
+    if t == "array":
+        item = schema_example(spec, schema.get("items") or {}, depth + 1)
+        return [] if item is None else [item]
+    if t == "integer":
+        return 0
+    if t == "number":
+        return 0.0
+    if t == "boolean":
+        return True
+    if t == "string":
+        return {
+            "date-time": "2024-01-01T00:00:00Z", "date": "2024-01-01", "email": "user@example.com",
+            "uuid": "00000000-0000-0000-0000-000000000000", "uri": "https://example.com",
+        }.get(schema.get("format"), "string")
+    return None
+
+
+def _openapi_base_url(spec, warnings):
+    if "openapi" in spec:
+        servers = spec.get("servers") or []
+        if not servers:
+            warnings.append("The spec has no servers; set the baseUrl variable to your API's address.")
+            return ""
+        server = servers[0]
+        url = server.get("url") or ""
+        for name, var in (server.get("variables") or {}).items():
+            url = url.replace("{" + name + "}", str((var or {}).get("default", "")))
+        if url.startswith("/"):
+            warnings.append(f"The server URL '{url}' is relative; prefix baseUrl with your API's host.")
+        return url.rstrip("/")
+    scheme = (spec.get("schemes") or ["https"])[0]
+    host = spec.get("host") or ""
+    if not host:
+        warnings.append("The spec has no host; set the baseUrl variable to your API's address.")
+    return f"{scheme}://{host}{spec.get('basePath') or ''}".rstrip("/") if host else (spec.get("basePath") or "").rstrip("/")
+
+
+def _openapi_security(spec, op, env_vars):
+    requirements = op.get("security", spec.get("security")) or []
+    schemes = (spec.get("components") or {}).get("securitySchemes") or spec.get("securityDefinitions") or {}
+    for requirement in requirements:
+        for name in (requirement or {}):
+            s = _resolve_ref(spec, schemes.get(name) or {})
+            t = (s.get("type") or "").lower()
+            scheme = (s.get("scheme") or "").lower()
+            if (t == "http" and scheme == "bearer") or (t == "oauth2" and not s.get("flows") and not s.get("tokenUrl")):
+                env_vars.setdefault("bearerToken", "")
+                return {"type": "Bearer Token", "token": "{{bearerToken}}"}
+            if (t == "http" and scheme == "basic") or t == "basic":
+                env_vars.setdefault("username", "")
+                env_vars.setdefault("password", "")
+                return {"type": "Basic Auth", "username": "{{username}}", "password": "{{password}}"}
+            if t == "apikey":
+                env_vars.setdefault("apiKey", "")
+                return {
+                    "type": "API Key", "key": s.get("name") or "X-API-Key", "value": "{{apiKey}}",
+                    "add_to": "Query Params" if s.get("in") == "query" else "Header",
+                }
+            if t == "oauth2":
+                flows = s.get("flows") or {}
+                env_vars.setdefault("clientId", "")
+                env_vars.setdefault("clientSecret", "")
+                cfg = {"type": "OAuth 2.0", "client_id": "{{clientId}}", "client_secret": "{{clientSecret}}"}
+                if "clientCredentials" in flows or s.get("flow") == "application":
+                    f = flows.get("clientCredentials") or s
+                    cfg.update(grant_type="Client Credentials", token_url=f.get("tokenUrl", ""))
+                elif "password" in flows or s.get("flow") == "password":
+                    f = flows.get("password") or s
+                    cfg.update(grant_type="Password Credentials", token_url=f.get("tokenUrl", ""))
+                else:
+                    f = flows.get("authorizationCode") or s
+                    cfg.update(grant_type="Authorization Code", token_url=f.get("tokenUrl", ""),
+                               auth_url=f.get("authorizationUrl", ""))
+                scopes = f.get("scopes") or {}
+                cfg["scope"] = " ".join(scopes.keys()) if isinstance(scopes, dict) else ""
+                return cfg
+    return None
+
+
+def _form_body_from_schema(spec, schema):
+    example = schema_example(spec, schema)
+    if not isinstance(example, dict):
+        return ""
+    return "&".join(f"{k}={'' if v is None else v}" for k, v in example.items() if not isinstance(v, (dict, list)))
+
+
+def import_openapi(spec):
+    """Convert an OpenAPI 3.x or Swagger 2.0 spec into one collection plus an environment."""
+    warnings = []
+    info = spec.get("info") or {}
+    title = info.get("title") or "OpenAPI import"
+    env_vars = {"baseUrl": _openapi_base_url(spec, warnings)}
+    requests_out = []
+    methods = ("get", "post", "put", "patch", "delete", "head", "options")
+
+    for path, path_item in (spec.get("paths") or {}).items():
+        path_item = _resolve_ref(spec, path_item)
+        if not isinstance(path_item, dict):
+            continue
+        shared_params = path_item.get("parameters") or []
+        for method in methods:
+            op = path_item.get(method)
+            if not isinstance(op, dict):
+                continue
+            label = op.get("summary") or op.get("operationId") or f"{method.upper()} {path}"
+            tags = op.get("tags") or []
+            name = f"{tags[0]} / {label}" if tags else label
+            url_path = re.sub(r"\{([^}/]+)\}", lambda m: "{{" + m.group(1) + "}}", path)
+            req = _empty_request(name, method.upper(), "{{baseUrl}}" + url_path)
+
+            # Operation-level parameters override path-level ones with the same name+location.
+            params_by_key = {}
+            for p in list(shared_params) + list(op.get("parameters") or []):
+                p = _resolve_ref(spec, p)
+                if isinstance(p, dict) and p.get("name"):
+                    params_by_key[(p.get("in"), p["name"])] = p
+
+            header_lines, form_fields = [], []
+            for (location, pname), p in params_by_key.items():
+                example = p.get("example")
+                if example is None:
+                    example = schema_example(spec, p.get("schema") or p)
+                if example is None or isinstance(example, (dict, list)):
+                    value = ""
+                elif isinstance(example, bool):
+                    value = "true" if example else "false"
+                else:
+                    value = str(example)
+                if location == "query":
+                    req["params"].append({"enabled": bool(p.get("required")), "key": pname, "value": value})
+                elif location == "header" and p.get("required"):
+                    header_lines.append(f"{pname}: {value}")
+                elif location == "path":
+                    env_vars.setdefault(pname, value)
+                elif location == "body":  # Swagger 2.0
+                    body = schema_example(spec, p.get("schema") or {})
+                    if body is not None:
+                        req["body_type"] = "JSON"
+                        req["body"] = json.dumps(body, indent=2)
+                        header_lines.append("Content-Type: application/json")
+                elif location == "formData":  # Swagger 2.0
+                    if p.get("type") != "file":
+                        form_fields.append(f"{pname}={value}")
+            if form_fields:
+                req["body_type"] = "Form Data"
+                req["body"] = "&".join(form_fields)
+
+            request_body = _resolve_ref(spec, op.get("requestBody") or {})
+            content = request_body.get("content") or {}
+            json_type = next((ct for ct in content if "json" in ct), None)
+            if json_type:
+                media = content[json_type] or {}
+                example = media.get("example")
+                if example is None and isinstance(media.get("examples"), dict) and media["examples"]:
+                    first = _resolve_ref(spec, next(iter(media["examples"].values())))
+                    example = first.get("value") if isinstance(first, dict) else None
+                if example is None:
+                    example = schema_example(spec, media.get("schema") or {})
+                req["body_type"] = "JSON"
+                req["body"] = json.dumps(example, indent=2) if example is not None else "{}"
+                header_lines.append(f"Content-Type: {json_type}")
+            elif "application/x-www-form-urlencoded" in content:
+                req["body_type"] = "Form Data"
+                req["body"] = _form_body_from_schema(spec, (content["application/x-www-form-urlencoded"] or {}).get("schema") or {})
+            elif "multipart/form-data" in content:
+                req["body_type"] = "Form Data"
+                req["body"] = _form_body_from_schema(spec, (content["multipart/form-data"] or {}).get("schema") or {})
+                warnings.append(f"{name}: add file attachments manually (multipart body).")
+
+            req["headers"] = "\n".join(header_lines)
+            auth = _openapi_security(spec, op, env_vars)
+            if auth:
+                req["auth"] = auth
+            requests_out.append(req)
+
+    if not requests_out:
+        warnings.append("No operations were found under 'paths'.")
+    return {"collections": {title: requests_out}, "environments": {title: env_vars}, "warnings": warnings}
+
+
+def import_any(data):
+    """Dispatch to the right importer. Returns the importer's result dict."""
+    kind = detect_import_format(data)
+    if kind == "postman-collection":
+        return import_postman_collection(data)
+    if kind == "postman-environment":
+        return import_postman_environment(data)
+    if kind == "openapi":
+        return import_openapi(data)
+    if isinstance(data, list):
+        return {"collections": {None: data}, "environments": {}, "warnings": []}
+    if isinstance(data, dict) and all(isinstance(v, list) for v in data.values()):
+        return {"collections": data, "environments": {}, "warnings": []}
+    raise ValueError("Unrecognised file: expected a CurlPyPro, Postman or OpenAPI/Swagger export.")
+
+
+# ---------------------------
+# GraphQL introspection
+# ---------------------------
+GRAPHQL_INTROSPECTION_QUERY = """\
+query IntrospectionQuery {
+  __schema {
+    queryType { name }
+    mutationType { name }
+    subscriptionType { name }
+    types {
+      kind name description
+      fields(includeDeprecated: false) {
+        name description
+        args { name type { ...TypeRef } defaultValue }
+        type { ...TypeRef }
+      }
+    }
+  }
+}
+fragment TypeRef on __Type {
+  kind name
+  ofType { kind name ofType { kind name ofType { kind name ofType { kind name } } } }
+}
+"""
+
+
+def graphql_type_str(t):
+    """Render an introspection type reference as SDL, e.g. [User!]!."""
+    if not t:
+        return "?"
+    kind = t.get("kind")
+    if kind == "NON_NULL":
+        return graphql_type_str(t.get("ofType")) + "!"
+    if kind == "LIST":
+        return "[" + graphql_type_str(t.get("ofType")) + "]"
+    return t.get("name") or "?"
+
+
+def graphql_named_type(t):
+    while t and t.get("kind") in ("NON_NULL", "LIST"):
+        t = t.get("ofType")
+    return t or {}
+
+
+def graphql_operation_for_field(schema, root_kind, field):
+    """Build (query_text, variables_dict) that calls one root field with a scalar selection."""
+    types = {t["name"]: t for t in schema.get("types") or [] if t.get("name")}
+
+    def selection(type_ref, depth, indent):
+        named = types.get(graphql_named_type(type_ref).get("name"), {})
+        if named.get("kind") not in ("OBJECT", "INTERFACE") or depth > 1:
+            return ""
+        lines = []
+        for f in named.get("fields") or []:
+            if any(graphql_type_str(a["type"]).endswith("!") for a in f.get("args") or []):
+                continue  # needs arguments; leave it out of the skeleton
+            inner = graphql_named_type(f["type"])
+            sub_kind = types.get(inner.get("name"), {}).get("kind")
+            if sub_kind in ("SCALAR", "ENUM"):
+                lines.append(f"{indent}  {f['name']}")
+            elif depth == 0 and sub_kind in ("OBJECT", "INTERFACE"):
+                sub = selection(f["type"], depth + 1, indent + "  ")
+                if sub:
+                    lines.append(f"{indent}  {f['name']} {sub}")
+        if not lines:
+            lines.append(f"{indent}  __typename")
+        return "{\n" + "\n".join(lines) + f"\n{indent}}}"
+
+    args = field.get("args") or []
+    var_decls = ", ".join(f"${a['name']}: {graphql_type_str(a['type'])}" for a in args)
+    call_args = ", ".join(f"{a['name']}: ${a['name']}" for a in args)
+    op_name = field["name"][:1].upper() + field["name"][1:]
+    header = f"{root_kind} {op_name}" + (f"({var_decls})" if var_decls else "")
+    call = field["name"] + (f"({call_args})" if call_args else "")
+    sel = selection(field["type"], 0, "  ")
+    query = f"{header} {{\n  {call}" + (f" {sel}" if sel else "") + "\n}\n"
+    variables = {a["name"]: None for a in args}
+    return query, variables
 
 
 # ---------------------------
@@ -1779,12 +2987,14 @@ class StressTestDialog(QDialog):
 # Environment dialog
 # ---------------------------
 class EnvironmentDialog(QDialog):
-    def __init__(self, envs, parent=None):
+    def __init__(self, envs, parent=None, secrets=None):
         super().__init__(parent)
         self.envs = envs
+        self.secrets = {k: list(v) for k, v in (secrets or {}).items()}
+        self._loaded_env = None  # env whose rows are currently shown
         self.setWindowTitle("Environment Manager")
         self.setModal(True)
-        self.resize(700, 500)
+        self.resize(760, 520)
         self.init_ui()
 
     def init_ui(self):
@@ -1826,6 +3036,7 @@ class EnvironmentDialog(QDialog):
         self.vars_layout = QVBoxLayout(self.vars_widget)
         self.vars_layout.setContentsMargins(0, 0, 0, 0)
         self.vars_layout.setSpacing(4)
+        self.vars_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         scroll = QScrollArea()
         scroll.setWidget(self.vars_widget)
@@ -1833,9 +3044,20 @@ class EnvironmentDialog(QDialog):
         vars_layout.addWidget(scroll)
 
         add_var_btn = QPushButton("Add Variable")
-        add_var_btn.clicked.connect(self.add_variable_row)
+        add_var_btn.clicked.connect(lambda: self.add_variable_row())
         add_var_btn.setFixedHeight(32)
         vars_layout.addWidget(add_var_btn)
+
+        if keyring_available():
+            note = ("Secret values are stored in your OS keychain (Windows Credential Manager, "
+                    "macOS Keychain or Secret Service), not in the CurlPyPro database.")
+        else:
+            note = ("Install the 'keyring' package to store secret values in your OS keychain. "
+                    "Until then every value is saved in ~/.curlpypro/curlpypro.db.")
+        note_label = QLabel(note)
+        note_label.setWordWrap(True)
+        note_label.setStyleSheet("color:#888;")
+        vars_layout.addWidget(note_label)
 
         layout.addWidget(vars_group)
 
@@ -1847,20 +3069,26 @@ class EnvironmentDialog(QDialog):
         if self.env_combo.currentText():
             self.load_environment()
 
-    def load_environment(self):
+    def load_environment(self, *_args):
+        # Keep edits made to the environment being switched away from.
+        if self._loaded_env is not None and self._loaded_env in self.envs:
+            self._save_env(self._loaded_env)
+
         for i in reversed(range(self.vars_layout.count())):
             widget = self.vars_layout.itemAt(i).widget()
             if widget:
                 widget.setParent(None)
 
         env_name = self.env_combo.currentText()
+        secret_names = set(self.secrets.get(env_name, []))
         if env_name in self.envs:
             env_vars = self.envs[env_name]
             for key, value in env_vars.items():
-                self.add_variable_row(key, value)
+                self.add_variable_row(key, value, key in secret_names)
         self.add_variable_row()
+        self._loaded_env = env_name or None
 
-    def add_variable_row(self, key="", value=""):
+    def add_variable_row(self, key="", value="", secret=False):
         row_widget = QWidget()
         row_layout = QHBoxLayout(row_widget)
         row_layout.setContentsMargins(6, 4, 6, 4)
@@ -1868,8 +3096,23 @@ class EnvironmentDialog(QDialog):
 
         key_input = QLineEdit(key)
         key_input.setPlaceholderText("Variable name")
-        value_input = QLineEdit(value)
+        value_input = QLineEdit(str(value))
         value_input.setPlaceholderText("Variable value")
+
+        secret_check = QCheckBox("Secret")
+        secret_check.setToolTip("Store this value in the OS keychain and hide it on screen")
+        if not keyring_available():
+            secret_check.setEnabled(False)
+            secret_check.setToolTip("Install the 'keyring' package to store secrets in the OS keychain")
+
+        def apply_mask(checked):
+            value_input.setEchoMode(
+                QLineEdit.EchoMode.PasswordEchoOnEdit if checked else QLineEdit.EchoMode.Normal
+            )
+
+        secret_check.toggled.connect(apply_mask)
+        secret_check.setChecked(secret)
+        apply_mask(secret)
 
         remove_btn = QPushButton("×")
         remove_btn.setFixedSize(28, 28)
@@ -1877,6 +3120,7 @@ class EnvironmentDialog(QDialog):
 
         row_layout.addWidget(key_input, 1)
         row_layout.addWidget(value_input, 2)
+        row_layout.addWidget(secret_check, 0)
         row_layout.addWidget(remove_btn, 0)
 
         self.vars_layout.addWidget(row_widget)
@@ -1893,7 +3137,6 @@ class EnvironmentDialog(QDialog):
             self.envs[name] = {}
             self.env_combo.addItem(name)
             self.env_combo.setCurrentText(name)
-            self.load_environment()
 
     def duplicate_environment(self):
         current = self.env_combo.currentText()
@@ -1904,10 +3147,12 @@ class EnvironmentDialog(QDialog):
             if name in self.envs:
                 QMessageBox.warning(self, "Exists", "An environment with that name already exists.")
                 return
+            self._save_env(current)
             self.envs[name] = dict(self.envs.get(current, {}))
+            if self.secrets.get(current):
+                self.secrets[name] = list(self.secrets[current])
             self.env_combo.addItem(name)
             self.env_combo.setCurrentText(name)
-            self.load_environment()
 
     def delete_environment(self):
         current = self.env_combo.currentText()
@@ -1917,6 +3162,8 @@ class EnvironmentDialog(QDialog):
         reply = QMessageBox.question(self, "Delete Environment", f"Delete environment '{current}'?")
         if reply == QMessageBox.StandardButton.Yes:
             del self.envs[current]
+            self.secrets.pop(current, None)
+            self._loaded_env = None  # so switching away does not write the deleted env back
             self.env_combo.removeItem(self.env_combo.currentIndex())
 
     def accept(self):
@@ -1925,20 +3172,27 @@ class EnvironmentDialog(QDialog):
 
     def save_current_environment(self):
         env_name = self.env_combo.currentText()
-        if not env_name:
-            return
+        if env_name:
+            self._save_env(env_name)
+
+    def _save_env(self, env_name):
         env_vars = {}
+        secret_names = []
         for i in range(self.vars_layout.count()):
             row_widget = self.vars_layout.itemAt(i).widget()
             if row_widget:
                 layout = row_widget.layout()
-                key_input = layout.itemAt(0).widget()
-                value_input = layout.itemAt(1).widget()
-                key = key_input.text().strip()
-                value = value_input.text().strip()
+                key = layout.itemAt(0).widget().text().strip()
+                value = layout.itemAt(1).widget().text().strip()
                 if key:
                     env_vars[key] = value
+                    if layout.itemAt(2).widget().isChecked():
+                        secret_names.append(key)
         self.envs[env_name] = env_vars
+        if secret_names:
+            self.secrets[env_name] = secret_names
+        else:
+            self.secrets.pop(env_name, None)
 
 
 # ---------------------------
@@ -2366,6 +3620,7 @@ class RequestPanel(QWidget):
         actions_menu.addAction("Generate - axios", lambda: self.generate_code_and_show("axios"))
         actions_menu.addSeparator()
         actions_menu.addAction("Stress Test...", self.open_stress_test)
+        actions_menu.addAction("WebSocket / SSE Console...", self.open_realtime_console)
         actions_menu.addSeparator()
         actions_menu.addAction(timeout_action)
 
@@ -2398,7 +3653,7 @@ class RequestPanel(QWidget):
 
         body_toolbar = QHBoxLayout()
         self.body_type_combo = QComboBox()
-        self.body_type_combo.addItems(["Raw", "JSON", "Form Data", "Binary"])
+        self.body_type_combo.addItems(["Raw", "JSON", "Form Data", "Binary", "GraphQL"])
         self.body_type_combo.currentTextChanged.connect(self.on_body_type_changed)
         body_toolbar.addWidget(QLabel("Body Type:"))
         body_toolbar.addWidget(self.body_type_combo)
@@ -2439,9 +3694,28 @@ class RequestPanel(QWidget):
         self.attachments_group.setVisible(False)
         body_layout.addWidget(self.attachments_group)
 
+        self.graphql_group = QGroupBox("GraphQL variables (JSON)")
+        graphql_layout = QVBoxLayout(self.graphql_group)
+        self.graphql_variables_text = QPlainTextEdit()
+        self.graphql_variables_text.setFont(_monospace_font(9))
+        self.graphql_variables_text.setPlaceholderText('{\n  "id": "{{USER_ID}}"\n}')
+        self.graphql_variables_text.setMaximumHeight(110)
+        graphql_layout.addWidget(self.graphql_variables_text)
+        graphql_toolbar = QHBoxLayout()
+        schema_btn = QPushButton("Browse Schema…")
+        schema_btn.setToolTip("Run an introspection query against this endpoint and browse its operations.")
+        schema_btn.clicked.connect(self.open_graphql_schema)
+        graphql_toolbar.addWidget(schema_btn)
+        graphql_toolbar.addStretch()
+        graphql_layout.addLayout(graphql_toolbar)
+        self.graphql_group.setVisible(False)
+        body_layout.addWidget(self.graphql_group)
+
         self.request_tabs.addTab(body_widget, "Body")
         self.request_tabs.addTab(self.create_auth_tab(), "Auth")
         self.request_tabs.addTab(self.create_advanced_tab(), "Advanced")
+        self.request_tabs.addTab(self.create_tests_tab(), "Tests")
+        self.request_tabs.addTab(self.create_capture_tab(), "Capture")
         self.request_tabs.addTab(self.create_scripts_tab(), "Scripts")
 
         request_layout.addWidget(self.request_tabs)
@@ -2499,6 +3773,30 @@ class RequestPanel(QWidget):
         self.response_insights = QTextEdit()
         self.response_insights.setReadOnly(True)
         self.response_tabs.addTab(self.response_insights, "Insights")
+
+        self.response_tests = QTextBrowser()
+        self.response_tests.setHtml("<p style='color:#888;'>Add assertions on the request's Tests tab.</p>")
+        self.response_tabs.addTab(self.response_tests, "Tests")
+
+        diff_widget = QWidget()
+        diff_layout = QVBoxLayout(diff_widget)
+        diff_layout.setContentsMargins(0, 0, 0, 0)
+        diff_toolbar = QHBoxLayout()
+        self.diff_label = QLabel("Send this request again to compare responses.")
+        self.diff_label.setWordWrap(True)
+        self.diff_sort_keys_check = QCheckBox("Ignore JSON key order")
+        self.diff_sort_keys_check.setChecked(True)
+        self.diff_sort_keys_check.toggled.connect(self._render_diff)
+        diff_toolbar.addWidget(self.diff_label, 1)
+        diff_toolbar.addWidget(self.diff_sort_keys_check)
+        diff_layout.addLayout(diff_toolbar)
+        self.response_diff = QTextBrowser()
+        self.response_diff.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        diff_layout.addWidget(self.response_diff)
+        self.response_tabs.addTab(diff_widget, "Diff")
+        self._diff_widget = diff_widget
+        self._diff_baseline = None  # (label, body_text) the current response is compared against
+        self._diff_current = None
 
         # API payloads commonly contain long tokens/base64 values.  Wrapping
         # keeps those lines inside the response viewport instead of making the
@@ -2693,15 +3991,7 @@ class RequestPanel(QWidget):
             )
 
     def _resolved_params(self, env: dict):
-        params = []
-        for row in self._params_snapshot():
-            if not row.get("enabled", True):
-                continue
-            key = apply_env((row.get("key") or "").strip(), env)
-            if not key:
-                continue
-            params.append((key, apply_env(row.get("value") or "", env)))
-        return params
+        return resolve_param_rows(self._params_snapshot(), env)
 
     # ---------- Advanced transport ----------
     def create_advanced_tab(self):
@@ -3135,33 +4425,7 @@ class RequestPanel(QWidget):
 
         Returns an (username, password) tuple for HTTP Basic auth, or None.
         """
-        cfg = self.get_auth_config()
-        t = cfg.get("type")
-        if t == "Bearer Token":
-            token = apply_env(cfg.get("token", "").strip(), env)
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
-        elif t == "Basic Auth":
-            user = apply_env(cfg.get("username", ""), env)
-            pwd = apply_env(cfg.get("password", ""), env)
-            if user or pwd:
-                return (user, pwd)
-        elif t == "API Key":
-            key = apply_env(cfg.get("key", "").strip(), env)
-            value = apply_env(cfg.get("value", ""), env)
-            if key:
-                if cfg.get("add_to") == "Query Params":
-                    if hasattr(params, "append"):
-                        params.append((key, value))
-                    else:
-                        params[key] = value
-                else:
-                    headers[key] = value
-        elif t == "OAuth 2.0":
-            token = self._ensure_oauth_token(cfg)
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
-        return None
+        return resolve_auth(self.get_auth_config(), headers, params, env, self._ensure_oauth_token)
 
     # ---------- OAuth 2.0 ----------
     def _ensure_oauth_token(self, cfg):
@@ -3187,20 +4451,7 @@ class RequestPanel(QWidget):
         return token
 
     def _oauth2_fetch_token_sync(self, cfg):
-        data = {"grant_type": "client_credentials" if cfg.get("grant_type") == "Client Credentials" else "password"}
-        if cfg.get("scope"):
-            data["scope"] = cfg["scope"]
-        if cfg.get("grant_type") == "Password Credentials":
-            data["username"] = cfg.get("username", "")
-            data["password"] = cfg.get("password", "")
-        resp = requests.post(
-            cfg.get("token_url", ""), data=data,
-            auth=(cfg.get("client_id", ""), cfg.get("client_secret", "")),
-            timeout=30,
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        return payload["access_token"], int(payload.get("expires_in", 3600))
+        return fetch_oauth2_token(resolve_env_in_config(cfg, self.main.get_active_env()))
 
     def _oauth2_get_token(self):
         cfg = self.get_auth_config()
@@ -3209,7 +4460,7 @@ class RequestPanel(QWidget):
         self.oauth_get_token_btn.setEnabled(False)
         self.oauth_status_label.setStyleSheet("color:#888;")
         self.oauth_status_label.setText("Requesting token…")
-        self._oauth_worker = OAuth2TokenWorker(cfg)
+        self._oauth_worker = OAuth2TokenWorker(resolve_env_in_config(cfg, self.main.get_active_env()))
         self._oauth_worker.token_ready.connect(self._on_oauth_token_ready)
         self._oauth_worker.error.connect(self._on_oauth_token_error)
         self._oauth_worker.start()
@@ -3231,6 +4482,276 @@ class RequestPanel(QWidget):
         token = self._oauth_access_token or ""
         shown = (token[:6] + "…" + token[-4:]) if len(token) > 14 else token
         self.oauth_token_display.setText(shown)
+
+    # ---------- Tests (assertions) & captures ----------
+    @staticmethod
+    def _make_rule_table(headers):
+        table = QTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        hdr = table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        for col in range(1, len(headers)):
+            hdr.setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
+        table.verticalHeader().setVisible(False)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        return table
+
+    @staticmethod
+    def _check_item(enabled):
+        item = QTableWidgetItem()
+        item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        item.setCheckState(Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked)
+        return item
+
+    @staticmethod
+    def _combo_cell(options, current):
+        combo = QComboBox()
+        combo.addItems(options)
+        if current in options:
+            combo.setCurrentText(current)
+        return combo
+
+    @staticmethod
+    def _remove_selected_rows(table):
+        for row in sorted({i.row() for i in table.selectedIndexes()}, reverse=True):
+            table.removeRow(row)
+
+    @staticmethod
+    def _cell_text(table, row, col):
+        widget = table.cellWidget(row, col)
+        if isinstance(widget, QComboBox):
+            return widget.currentText()
+        item = table.item(row, col)
+        return item.text() if item else ""
+
+    def create_tests_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        hint = QLabel(
+            "Assertions run after every response and in the collection runner. "
+            "JSON paths look like $.data.items[0].id (add .length for a count). "
+            "{{VARS}} work in Property and Expected."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#888;")
+        layout.addWidget(hint)
+
+        self.tests_table = self._make_rule_table(["", "Source", "Property (header / JSON path)", "Operator", "Expected"])
+        layout.addWidget(self.tests_table)
+
+        toolbar = QHBoxLayout()
+        add_btn = QPushButton("Add Assertion")
+        add_btn.clicked.connect(lambda: self._add_test_row())
+        presets_btn = QToolButton()
+        presets_btn.setText("Quick add ▾")
+        presets_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        presets = QMenu(presets_btn)
+        presets.addAction("Status is 200", lambda: self._add_test_row("Status code", "", "equals", "200"))
+        presets.addAction("Status is 2xx", lambda: self._add_test_row("Status code", "", "matches regex", r"^2\d\d$"))
+        presets.addAction("Response time < 1000 ms", lambda: self._add_test_row("Response time (ms)", "", "<", "1000"))
+        presets.addAction("Content-Type is JSON", lambda: self._add_test_row("Header", "Content-Type", "contains", "json"))
+        presets.addAction("JSON field exists", lambda: self._add_test_row("JSON path", "$.id", "exists", ""))
+        presets_btn.setMenu(presets)
+        remove_btn = QPushButton("Remove Selected")
+        remove_btn.clicked.connect(lambda: self._remove_selected_rows(self.tests_table))
+        toolbar.addWidget(add_btn)
+        toolbar.addWidget(presets_btn)
+        toolbar.addStretch()
+        toolbar.addWidget(remove_btn)
+        layout.addLayout(toolbar)
+        return widget
+
+    def _add_test_row(self, source="Status code", prop="", operator="equals", expected="200", enabled=True):
+        row = self.tests_table.rowCount()
+        self.tests_table.insertRow(row)
+        self.tests_table.setItem(row, 0, self._check_item(enabled))
+        self.tests_table.setCellWidget(row, 1, self._combo_cell(ASSERTION_SOURCES, source))
+        self.tests_table.setItem(row, 2, QTableWidgetItem(prop))
+        self.tests_table.setCellWidget(row, 3, self._combo_cell(ASSERTION_OPERATORS, operator))
+        self.tests_table.setItem(row, 4, QTableWidgetItem(expected))
+
+    def _tests_snapshot(self):
+        rows = []
+        for row in range(self.tests_table.rowCount()):
+            check = self.tests_table.item(row, 0)
+            rows.append({
+                "enabled": check is None or check.checkState() == Qt.CheckState.Checked,
+                "source": self._cell_text(self.tests_table, row, 1),
+                "property": self._cell_text(self.tests_table, row, 2),
+                "operator": self._cell_text(self.tests_table, row, 3),
+                "expected": self._cell_text(self.tests_table, row, 4),
+            })
+        return rows
+
+    def _restore_tests(self, rows):
+        self.tests_table.setRowCount(0)
+        for r in rows or []:
+            if isinstance(r, dict):
+                self._add_test_row(r.get("source", "Status code"), r.get("property", ""),
+                                   r.get("operator", "equals"), str(r.get("expected", "")),
+                                   bool(r.get("enabled", True)))
+
+    def create_capture_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        hint = QLabel(
+            "After each response, matched values are saved into the active environment so later "
+            "requests can use {{VARIABLE}}. Example: variable TOKEN, source JSON path, "
+            "expression $.access_token. Body regex uses the first capture group."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#888;")
+        layout.addWidget(hint)
+
+        self.captures_table = self._make_rule_table(["", "Variable", "Source", "Expression"])
+        layout.addWidget(self.captures_table)
+
+        toolbar = QHBoxLayout()
+        add_btn = QPushButton("Add Capture")
+        add_btn.clicked.connect(lambda: self._add_capture_row())
+        remove_btn = QPushButton("Remove Selected")
+        remove_btn.clicked.connect(lambda: self._remove_selected_rows(self.captures_table))
+        toolbar.addWidget(add_btn)
+        toolbar.addStretch()
+        toolbar.addWidget(remove_btn)
+        layout.addLayout(toolbar)
+        return widget
+
+    def _add_capture_row(self, variable="", source="JSON path", expression="$.", enabled=True):
+        row = self.captures_table.rowCount()
+        self.captures_table.insertRow(row)
+        self.captures_table.setItem(row, 0, self._check_item(enabled))
+        self.captures_table.setItem(row, 1, QTableWidgetItem(variable))
+        self.captures_table.setCellWidget(row, 2, self._combo_cell(CAPTURE_SOURCES, source))
+        self.captures_table.setItem(row, 3, QTableWidgetItem(expression))
+
+    def _captures_snapshot(self):
+        rows = []
+        for row in range(self.captures_table.rowCount()):
+            check = self.captures_table.item(row, 0)
+            rows.append({
+                "enabled": check is None or check.checkState() == Qt.CheckState.Checked,
+                "variable": self._cell_text(self.captures_table, row, 1),
+                "source": self._cell_text(self.captures_table, row, 2),
+                "expression": self._cell_text(self.captures_table, row, 3),
+            })
+        return rows
+
+    def _restore_captures(self, rows):
+        self.captures_table.setRowCount(0)
+        for r in rows or []:
+            if isinstance(r, dict):
+                self._add_capture_row(r.get("variable", ""), r.get("source", "JSON path"),
+                                      r.get("expression", ""), bool(r.get("enabled", True)))
+
+    def _apply_captures(self, captures, response):
+        """Store captured values in the active environment. Returns a status note."""
+        if not captures:
+            return ""
+        values, problems = extract_captures(captures, response)
+        note = ""
+        if values:
+            self.main.get_active_env().update(values)
+            self.main.persist_envs()
+            note = f" — captured {', '.join(values)}"
+        if problems:
+            note += f" — capture failed: {problems[0]}" + (f" (+{len(problems) - 1} more)" if len(problems) > 1 else "")
+        return note
+
+    def _render_test_results(self, results):
+        """Show assertion results in the response Tests tab. Returns (passed, total) or None."""
+        idx = self.response_tabs.indexOf(self.response_tests)
+        if not results:
+            self.response_tabs.setTabText(idx, "Tests")
+            self.response_tests.setHtml("<p style='color:#888;'>No assertions on this request. "
+                                        "Add them on the request's Tests tab.</p>")
+            return None
+        passed = sum(1 for r in results if r["passed"])
+        self.response_tabs.setTabText(idx, f"Tests ({passed}/{len(results)})")
+        lines = []
+        for r in results:
+            icon, color = ("✔", "#28a745") if r["passed"] else ("✘", "#dc3545")
+            msg = f" <span style='color:#888;'>— {_html.escape(r['message'])}</span>" if r["message"] else ""
+            lines.append(f"<div style='margin:3px 0;'><b style='color:{color};'>{icon}</b> "
+                         f"{_html.escape(r['name'])}{msg}</div>")
+        self.response_tests.setHtml("".join(lines))
+        return passed, len(results)
+
+    # ---------- Response diff ----------
+    @staticmethod
+    def _diff_text(response):
+        ct = (response.headers.get("Content-Type", "") or "").lower()
+        if any(x in ct for x in ("image/", "audio/", "video/", "octet-stream", "application/pdf", "application/zip")):
+            return f"[binary body: {ct}, {len(response.content or b''):,} bytes]"
+        return response.text or ""
+
+    def _push_diff_response(self, label, body_text):
+        """Make the newest response 'current' and the previous one the baseline."""
+        if self._diff_current is not None:
+            self._diff_baseline = self._diff_current
+        self._diff_current = (label, body_text)
+        self._render_diff()
+
+    def show_diff_against(self, label, body_text):
+        """Compare this tab's latest response with an arbitrary baseline (e.g. from history)."""
+        if self._diff_current is None:
+            QMessageBox.information(self, "Compare Responses", "Send a request in this tab first, then compare.")
+            return
+        self._diff_baseline = (label, body_text or "")
+        self._render_diff()
+        self.response_tabs.setCurrentWidget(self._diff_widget)
+
+    def _render_diff(self, *_args):
+        if not self._diff_baseline or not self._diff_current:
+            self.diff_label.setText("Send this request again to compare responses.")
+            self.response_diff.clear()
+            return
+        sort_keys = self.diff_sort_keys_check.isChecked()
+        (old_label, old_body), (new_label, new_body) = self._diff_baseline, self._diff_current
+        old_norm = normalize_for_diff(old_body, sort_keys)
+        new_norm = normalize_for_diff(new_body, sort_keys)
+        if old_norm == new_norm:
+            self.diff_label.setText(f"{old_label}  →  {new_label}: no differences")
+            self.response_diff.setHtml("<p style='color:#28a745;'>The responses are identical.</p>")
+            return
+        body, added, removed = diff_html(old_norm, new_norm, old_label, new_label)
+        self.diff_label.setText(f"{old_label}  →  {new_label}:  +{added} / −{removed} lines")
+        self.response_diff.setHtml(body)
+
+    # ---------- GraphQL ----------
+    def open_graphql_schema(self):
+        req = self._build_request_dict()
+        req["body_type"] = "GraphQL"
+        req["body"] = GRAPHQL_INTROSPECTION_QUERY
+        req["graphql_variables"] = ""
+        raw_timeout = self.timeout_spin.value()
+        try:
+            call = prepare_request(req, self.main.get_active_env(), raw_timeout or None,
+                                   oauth_token=self._ensure_oauth_token)
+        except RequestBuildError as e:
+            QMessageBox.warning(self, e.title, str(e))
+            return
+        dlg = GraphQLSchemaDialog(call, self.main.cookie_jar, self)
+        dlg.operationChosen.connect(self._insert_graphql_operation)
+        dlg.show()
+
+    def _insert_graphql_operation(self, query, variables):
+        self.body_type_combo.setCurrentText("GraphQL")
+        self.body_text.setPlainText(query)
+        self.graphql_variables_text.setPlainText(json.dumps(variables, indent=2) if variables else "")
+        self.request_tabs.setCurrentIndex(2)
+
+    # ---------- WebSocket / SSE ----------
+    def open_realtime_console(self):
+        env = self.main.get_active_env()
+        dlg = RealtimeConsoleDialog(
+            apply_env(self.url_input.text().strip(), env),
+            self.headers_text.toPlainText(),
+            env,
+            self._advanced_snapshot().get("verify_ssl", True),
+            self,
+        )
+        dlg.show()
 
     # ---------- Post-response scripts ----------
     def create_scripts_tab(self):
@@ -3268,12 +4789,7 @@ class RequestPanel(QWidget):
         return widget
 
     def _compile_post_response_script(self, code):
-        ns = {}
-        exec(compile(code, '<post_response_script>', 'exec'), ns)
-        fn = ns.get('on_response')
-        if not callable(fn):
-            raise ValueError("Script must define on_response(response, env)")
-        return fn
+        return compile_post_response_script(code)
 
     def _verify_post_response_script(self):
         code = self.post_response_script_editor.toPlainText().strip()
@@ -3299,7 +4815,7 @@ class RequestPanel(QWidget):
             fn = self._compile_post_response_script(code)
             env = self.main.get_active_env()
             fn(_ScriptResponse(response, elapsed * 1000), env)
-            save_document("envs", self.main.envs)
+            self.main.persist_envs()
         except Exception as e:
             QMessageBox.critical(self, "Post-response Script Error", str(e))
 
@@ -3818,6 +5334,7 @@ class RequestPanel(QWidget):
             return
         if store['result'] is not None:
             self._load_response_to_ui(store['result'])
+            self._render_test_results(store.get('tests'))
         elif store['error'] is not None:
             QMessageBox.critical(self, "Request Error", f"Request #{req_id + 1} failed:\n{store['error']}")
         else:
@@ -3988,12 +5505,16 @@ class RequestPanel(QWidget):
             self.body_text.setPlaceholderText("key=value&other=one  (for text fields)\nUse Attachments below for files.")
         elif text == "Binary":
             self.body_text.setPlaceholderText("(Binary payload - use Save/Load to manipulate file)")
+        elif text == "GraphQL":
+            self.body_text.setPlaceholderText("query GetUser($id: ID!) {\n  user(id: $id) {\n    id\n    name\n  }\n}")
         else:
             self.body_text.setPlaceholderText('{\n  "key": "value",\n  "user": "{{USERNAME}}"\n}')
 
         show_attachments = (text == "Form Data")
         if hasattr(self, "attachments_group"):
             self.attachments_group.setVisible(show_attachments)
+        if hasattr(self, "graphql_group"):
+            self.graphql_group.setVisible(text == "GraphQL")
 
     def _update_method_color(self, *_args):
         colors = {
@@ -4130,106 +5651,53 @@ class RequestPanel(QWidget):
                 return
 
         env = self.main.get_active_env()
-
-        method = self.method_combo.currentText()
-        url = apply_env(self.url_input.text().strip(), env)
-        if not url:
-            QMessageBox.warning(self, "Invalid URL", "Please enter a valid URL.")
+        raw_timeout = self.timeout_spin.value()
+        timeout = None if raw_timeout == 0 else raw_timeout
+        try:
+            call = prepare_request(self._build_request_dict(), env, timeout,
+                                   oauth_token=self._ensure_oauth_token)
+        except RequestBuildError as e:
+            if e.critical:
+                QMessageBox.critical(self, e.title, str(e))
+            else:
+                QMessageBox.warning(self, e.title, str(e))
             return
+        method = call["method"]
+        url = call["url"]
 
         self.main._update_tab_title(self)
 
-        headers = {}
-        for line in self.headers_text.toPlainText().splitlines():
-            line = line.strip()
-            if line and ":" in line:
-                key, value = line.split(":", 1)
-                headers[key.strip()] = apply_env(value.strip(), env)
-
-        body_raw = apply_env(self.body_text.toPlainText().strip(), env)
-        json_body = None
-        data = None
-        files = None
-
-        content_type = headers.get("Content-Type", "").lower()
-        body_type = self.body_type_combo.currentText()
-
-        if body_type == "JSON" or "application/json" in content_type or (body_raw and body_raw.startswith(("{", "["))):
-            if body_raw:
-                try:
-                    json_body = json.loads(body_raw)
-                    if "Content-Type" not in headers:
-                        headers["Content-Type"] = "application/json"
-                except json.JSONDecodeError as e:
-                    QMessageBox.warning(self, "Invalid JSON", f"JSON parsing error: {str(e)}")
-                    return
-
-        elif body_type == "Form Data":
-            data = {}
-            if body_raw:
-                for pair in body_raw.split("&"):
-                    if "=" in pair:
-                        k, v = pair.split("=", 1)
-                        data[k] = v
-
-            if self.file_attachments:
-                files = []
-                for hk in list(headers.keys()):
-                    if hk.lower() == "content-type":
-                        del headers[hk]
-                try:
-                    for att in self.file_attachments:
-                        fp = open(att["path"], "rb")
-                        files.append((att["field"], (att["filename"], fp, att["mime"])))
-                except Exception as e:
-                    QMessageBox.critical(self, "File Error", f"Failed to open attachment: {e}")
-                    for f in files or []:
-                        try:
-                            if hasattr(f[1][1], "close"):
-                                f[1][1].close()
-                        except Exception:
-                            pass
-                    return
-
-        elif body_type == "Binary":
-            data = body_raw.encode("utf-8") if body_raw else None
-        else:
-            data = body_raw.encode("utf-8") if body_raw else None
-
-        params = self._resolved_params(env)
-        auth_tuple = self.apply_auth(headers, params, env)
         advanced = self._advanced_snapshot()
-        cookie_jar = self.main.cookie_jar if advanced.get("use_cookie_jar", True) else None
-
         snapshot = {
             'req_url': self.url_input.text(),
             'req_headers_text': self.headers_text.toPlainText(),
             'params': self._params_snapshot(),
             'body_type': self.body_type_combo.currentText(),
             'request_body': self.body_text.toPlainText(),
+            'graphql_variables': self.graphql_variables_text.toPlainText(),
             'auth': self.get_auth_config(),
             'advanced': dict(advanced),
             'attachments': self._attachments_snapshot(),
             'output_file': self._pending_output_file,
             'scripts': self._scripts_snapshot(),
+            'tests': self._tests_snapshot(),
+            'captures': self._captures_snapshot(),
         }
 
         req_id = self._req_counter
         self._req_counter += 1
 
-        raw_timeout = self.timeout_spin.value()
-        timeout = None if raw_timeout == 0 else raw_timeout
         thread = RequestThread(
-            method, url, headers, json_body, data, files, timeout,
-            params=params or None, auth=auth_tuple,
-            allow_redirects=advanced.get("follow_redirects", True),
-            verify_ssl=advanced.get("verify_ssl", True),
-            max_redirects=advanced.get("max_redirects", 30),
-            retry_total=advanced.get("retry_total", 0),
-            retry_backoff=advanced.get("retry_backoff", 0.0),
-            retry_statuses=parse_status_code_list(advanced.get("retry_statuses", "")),
-            cookie_jar=cookie_jar,
-            proxies=self._resolved_proxies(env),
+            method, url, call["headers"], call["json_body"], call["data"], call["files"], timeout,
+            params=call["params"], auth=call["auth"],
+            allow_redirects=call["allow_redirects"],
+            verify_ssl=call["verify_ssl"],
+            max_redirects=call["max_redirects"],
+            retry_total=call["retry_total"],
+            retry_backoff=call["retry_backoff"],
+            retry_statuses=call["retry_statuses"],
+            cookie_jar=self.main.cookie_jar if call["use_cookie_jar"] else None,
+            proxies=call["proxies"],
         )
         self._request_store[req_id] = {
             'thread': thread,
@@ -4264,7 +5732,27 @@ class RequestPanel(QWidget):
         result['output_file'] = snapshot.get('output_file')
 
         self._load_response_to_ui(result)
+        capture_note = self._apply_captures(snapshot.get('captures'), response)
         self._run_post_response_script(response, elapsed)
+
+        test_results = evaluate_assertions(
+            snapshot.get('tests'), response, elapsed * 1000, self.main.get_active_env()
+        )
+        if store:
+            store['tests'] = test_results
+        test_summary = self._render_test_results(test_results)
+        test_note = ""
+        if test_summary:
+            passed, total = test_summary
+            test_note = f" — tests {passed}/{total} passed"
+            self.response_summary.setText(self.response_summary.text() + f" — Tests: {passed}/{total} passed")
+            if passed < total:
+                self.response_tabs.setCurrentWidget(self.response_tests)
+
+        self._push_diff_response(
+            f"#{req_id + 1} ({response.status_code}, {time.strftime('%H:%M:%S')})",
+            self._diff_text(response),
+        )
 
         try:
             raw_text = response.text
@@ -4291,13 +5779,18 @@ class RequestPanel(QWidget):
                 "attachments": snapshot.get('attachments', self._attachments_snapshot()),
                 "output_file": snapshot.get('output_file'),
                 "scripts": snapshot.get('scripts', self._scripts_snapshot()),
+                "graphql_variables": snapshot.get('graphql_variables', ""),
+                "tests": snapshot.get('tests', []),
+                "captures": snapshot.get('captures', []),
             }
             self.main.record_history(entry)
         except Exception:
             pass
 
         status_code = response.status_code
-        self.main.status_bar.showMessage(f"Request #{req_id + 1} done: {status_code} ({elapsed*1000:.0f} ms)")
+        self.main.status_bar.showMessage(
+            f"Request #{req_id + 1} done: {status_code} ({elapsed*1000:.0f} ms){test_note}{capture_note}"
+        )
 
         ct = (response.headers.get("Content-Type", "") or "").lower()
         if self._is_binary_content_type(ct) and "image/" not in ct:
@@ -4347,6 +5840,9 @@ class RequestPanel(QWidget):
                 "attachments": snapshot.get('attachments', self._attachments_snapshot()),
                 "output_file": snapshot.get('output_file'),
                 "scripts": snapshot.get('scripts', self._scripts_snapshot()),
+                "graphql_variables": snapshot.get('graphql_variables', ""),
+                "tests": snapshot.get('tests', []),
+                "captures": snapshot.get('captures', []),
             }
             self.main.record_history(entry)
         except Exception:
@@ -4367,6 +5863,9 @@ class RequestPanel(QWidget):
             "attachments": self._attachments_snapshot(),
             "output_file": self._pending_output_file,
             "scripts": self._scripts_snapshot(),
+            "graphql_variables": self.graphql_variables_text.toPlainText(),
+            "tests": self._tests_snapshot(),
+            "captures": self._captures_snapshot(),
         }
 
     def save_to_collection(self):
@@ -4415,6 +5914,9 @@ class RequestPanel(QWidget):
         self._restore_advanced(req.get("advanced", {}))
         self._pending_output_file = req.get("output_file") or None
         self._restore_scripts(req.get("scripts", {}))
+        self.graphql_variables_text.setPlainText(req.get("graphql_variables", "") or "")
+        self._restore_tests(req.get("tests", []))
+        self._restore_captures(req.get("captures", []))
         self.main._update_tab_title(self)
 
     def apply_history_entry(self, data):
@@ -4446,6 +5948,11 @@ class RequestPanel(QWidget):
             self._restore_advanced(data.get("advanced", {}))
         if "scripts" in data:
             self._restore_scripts(data.get("scripts", {}))
+        self.graphql_variables_text.setPlainText(data.get("graphql_variables", "") or "")
+        if "tests" in data:
+            self._restore_tests(data.get("tests", []))
+        if "captures" in data:
+            self._restore_captures(data.get("captures", []))
 
         self._pending_output_file = data.get("output_file") or None
         self.main._update_tab_title(self)
@@ -4501,6 +6008,14 @@ class RequestPanel(QWidget):
                 key, value = line.split(":", 1)
                 headers[key.strip()] = apply_env(value.strip(), env)
         body_raw = apply_env(self.body_text.toPlainText().strip(), env)
+        if self.body_type_combo.currentText() == "GraphQL":
+            try:
+                payload = build_graphql_payload(body_raw, self.graphql_variables_text.toPlainText(), env)
+            except RequestBuildError:
+                payload = {"query": body_raw}
+            body_raw = json.dumps(payload)
+            if "Content-Type" not in headers:
+                headers["Content-Type"] = "application/json"
 
         params = self._resolved_params(env)
         auth_tuple = self.apply_auth(headers, params, env)
@@ -4970,7 +6485,14 @@ class RequestPanel(QWidget):
         body_type = self.body_type_combo.currentText()
         content_type = headers.get("Content-Type", "").lower()
 
-        if body_type == "JSON" or "application/json" in content_type or (body_raw and body_raw.startswith(("{", "["))):
+        if body_type == "GraphQL":
+            try:
+                json_body = build_graphql_payload(body_raw, self.graphql_variables_text.toPlainText(), env)
+            except RequestBuildError as e:
+                QMessageBox.warning(self, e.title, str(e))
+                return
+            headers.setdefault("Content-Type", "application/json")
+        elif body_type == "JSON" or "application/json" in content_type or (body_raw and body_raw.startswith(("{", "["))):
             if body_raw:
                 try:
                     json_body = json.loads(body_raw)
@@ -5013,6 +6535,869 @@ class RequestPanel(QWidget):
         dlg.show()
 
 
+# Threads still running when their dialog closes are parked here until they
+# finish, so Qt never destroys a QThread that is still executing.
+_detached_threads = set()
+
+
+def _keep_thread_alive(thread):
+    if thread is None or not thread.isRunning():
+        return
+    _detached_threads.add(thread)
+    thread.finished.connect(lambda t=thread: _detached_threads.discard(t))
+    thread.setParent(None)
+
+
+def resolve_env_in_config(cfg, env):
+    """Resolve {{VAR}} in every string value of an auth config."""
+    return {k: apply_env(v, env) if isinstance(v, str) else v for k, v in (cfg or {}).items()}
+
+
+def compile_post_response_script(code):
+    ns = {}
+    exec(compile(code, '<post_response_script>', 'exec'), ns)
+    fn = ns.get('on_response')
+    if not callable(fn):
+        raise ValueError("Script must define on_response(response, env)")
+    return fn
+
+
+# ---------------------------
+# Collection runner
+# ---------------------------
+class CollectionRunWorker(QThread):
+    """Runs a list of saved requests in order, with captures, scripts and assertions."""
+
+    result = pyqtSignal(dict)
+    variables = pyqtSignal(dict)
+
+    def __init__(self, requests_list, env, iterations=1, delay_ms=0, stop_on_failure=False,
+                 timeout=30, cookie_jar=None, run_scripts=True):
+        super().__init__()
+        self.requests_list = requests_list
+        self.env = env  # a private copy; changes are reported through `variables`
+        self.iterations = max(1, iterations)
+        self.delay_ms = delay_ms
+        self.stop_on_failure = stop_on_failure
+        self.timeout = timeout
+        self.cookie_jar = cookie_jar
+        self.run_scripts = run_scripts
+        self._stop = False
+        self._tokens = {}
+
+    def stop(self):
+        self._stop = True
+
+    def _oauth_token(self, cfg):
+        if cfg.get("grant_type") == "Authorization Code":
+            raise RuntimeError("Authorization Code tokens need a browser login; get one on the request's Auth tab first")
+        cfg = resolve_env_in_config(cfg, self.env)
+        key = (cfg.get("token_url"), cfg.get("client_id"), cfg.get("scope"), cfg.get("username"))
+        cached = self._tokens.get(key)
+        if cached and cached[1] > time.time():
+            return cached[0]
+        token, expires_in = fetch_oauth2_token(cfg)
+        self._tokens[key] = (token, time.time() + max(0, expires_in - 30))
+        return token
+
+    def _run_script(self, req, response, elapsed, row):
+        scripts = req.get("scripts") or {}
+        code = (scripts.get("post_response") or "").strip()
+        if not (self.run_scripts and scripts.get("enabled") and code):
+            return
+        before = dict(self.env)
+        try:
+            compile_post_response_script(code)(_ScriptResponse(response, elapsed * 1000), self.env)
+        except Exception as e:
+            row["notes"].append(f"Post-response script error: {e}")
+        changed = {k: v for k, v in self.env.items() if before.get(k) != v}
+        if changed:
+            self.variables.emit(changed)
+
+    def _sleep(self):
+        end = time.time() + self.delay_ms / 1000.0
+        while not self._stop and time.time() < end:
+            time.sleep(0.05)
+
+    def run(self):
+        for iteration in range(1, self.iterations + 1):
+            for index, req in enumerate(self.requests_list):
+                if self._stop:
+                    return
+                row = {
+                    "iteration": iteration, "index": index,
+                    "name": req.get("name") or f"Request {index + 1}",
+                    "method": (req.get("method") or "GET").upper(),
+                    "url": req.get("url") or "", "status": None, "reason": "",
+                    "elapsed_ms": None, "size": 0, "tests": [], "error": "", "notes": [],
+                    "response_headers": {}, "response_body": "",
+                }
+                try:
+                    def oauth(cfg):
+                        try:
+                            return self._oauth_token(cfg)
+                        except Exception as e:
+                            row["notes"].append(f"OAuth 2.0: {e}")
+                            return None
+
+                    call = prepare_request(req, self.env, self.timeout, oauth)
+                    row["url"] = call["url"]
+                    response, elapsed = execute_call(call, self.cookie_jar)
+                    row.update(
+                        status=response.status_code, reason=response.reason,
+                        elapsed_ms=round(elapsed * 1000), size=len(response.content or b""),
+                        response_headers=dict(response.headers),
+                        response_body=(response.text or "")[:20000],
+                    )
+                    values, problems = extract_captures(req.get("captures"), response)
+                    if values:
+                        self.env.update(values)
+                        self.variables.emit(values)
+                    row["notes"].extend(problems)
+                    self._run_script(req, response, elapsed, row)
+                    row["tests"] = evaluate_assertions(req.get("tests"), response, elapsed * 1000, self.env)
+                except RequestBuildError as e:
+                    row["error"] = f"{e.title}: {e}"
+                except Exception as e:
+                    row["error"] = str(e)
+                self.result.emit(row)
+
+                failed = bool(row["error"]) or any(not t["passed"] for t in row["tests"])
+                if failed and self.stop_on_failure:
+                    return
+                if self.delay_ms:
+                    self._sleep()
+
+
+class CollectionRunnerDialog(QDialog):
+    def __init__(self, main_window, collection_name):
+        super().__init__(main_window)
+        self.main = main_window
+        self.collection_name = collection_name
+        self.requests_list = list(main_window.collections.get(collection_name, []))
+        self.results = []
+        self.worker = None
+        self._started_at = 0
+        self.setWindowTitle(f"Run Collection — {collection_name}")
+        self.resize(1150, 720)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # --- Left: run settings + request selection ---
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+
+        settings_group = QGroupBox("Run settings")
+        form = QVBoxLayout(settings_group)
+
+        env_row = QHBoxLayout()
+        env_row.addWidget(QLabel("Environment:"))
+        self.env_combo = QComboBox()
+        self.env_combo.addItems(list(self.main.envs.keys()))
+        self.env_combo.setCurrentText(self.main.env_combo.currentText())
+        env_row.addWidget(self.env_combo, 1)
+        form.addLayout(env_row)
+
+        iter_row = QHBoxLayout()
+        iter_row.addWidget(QLabel("Iterations:"))
+        self.iterations_spin = QSpinBox()
+        self.iterations_spin.setRange(1, 10000)
+        iter_row.addWidget(self.iterations_spin)
+        iter_row.addWidget(QLabel("Delay:"))
+        self.delay_spin = QSpinBox()
+        self.delay_spin.setRange(0, 600000)
+        self.delay_spin.setSuffix(" ms")
+        iter_row.addWidget(self.delay_spin)
+        form.addLayout(iter_row)
+
+        self.stop_on_failure_check = QCheckBox("Stop on first failure")
+        self.save_vars_check = QCheckBox("Save captured variables to the environment")
+        self.save_vars_check.setChecked(True)
+        self.run_scripts_check = QCheckBox("Run post-response scripts")
+        self.run_scripts_check.setChecked(True)
+        for w in (self.stop_on_failure_check, self.save_vars_check, self.run_scripts_check):
+            form.addWidget(w)
+        left_layout.addWidget(settings_group)
+
+        requests_group = QGroupBox("Requests (run top to bottom)")
+        rl = QVBoxLayout(requests_group)
+        self.request_list = QListWidget()
+        for req in self.requests_list:
+            item = QListWidgetItem(f"{(req.get('method') or 'GET').upper()}  {req.get('name') or req.get('url', '')}")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            self.request_list.addItem(item)
+        rl.addWidget(self.request_list)
+        sel_row = QHBoxLayout()
+        all_btn = QPushButton("Select All")
+        none_btn = QPushButton("Select None")
+        all_btn.clicked.connect(lambda: self._set_all_checked(True))
+        none_btn.clicked.connect(lambda: self._set_all_checked(False))
+        sel_row.addWidget(all_btn)
+        sel_row.addWidget(none_btn)
+        rl.addLayout(sel_row)
+        left_layout.addWidget(requests_group, 1)
+
+        # --- Right: results ---
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.summary_label = QLabel("Choose requests and press Run.")
+        self.summary_label.setWordWrap(True)
+        right_layout.addWidget(self.summary_label)
+        self.progress = QProgressBar()
+        right_layout.addWidget(self.progress)
+
+        self.results_table = QTableWidget(0, 7)
+        self.results_table.setHorizontalHeaderLabels(["Iter", "#", "Request", "Status", "ms", "Tests", "Result"])
+        hdr = self.results_table.horizontalHeader()
+        for col in range(7):
+            hdr.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.results_table.verticalHeader().setVisible(False)
+        self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.results_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.results_table.currentCellChanged.connect(lambda row, *_: self._show_details(row))
+
+        self.details = QTextBrowser()
+        results_splitter = QSplitter(Qt.Orientation.Vertical)
+        results_splitter.addWidget(self.results_table)
+        results_splitter.addWidget(self.details)
+        results_splitter.setSizes([420, 240])
+        right_layout.addWidget(results_splitter, 1)
+
+        splitter.addWidget(left)
+        splitter.addWidget(right)
+        splitter.setSizes([340, 810])
+        layout.addWidget(splitter, 1)
+
+        buttons = QHBoxLayout()
+        self.run_btn = QPushButton("Run")
+        self.run_btn.setObjectName("send_btn")
+        self.run_btn.clicked.connect(self.start_run)
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.stop_run)
+        self.export_btn = QPushButton("Export Results…")
+        self.export_btn.setEnabled(False)
+        self.export_btn.clicked.connect(self.export_results)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        for b in (self.run_btn, self.stop_btn, self.export_btn):
+            b.setFixedHeight(34)
+            buttons.addWidget(b)
+        buttons.addStretch()
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+    def _set_all_checked(self, checked):
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for i in range(self.request_list.count()):
+            self.request_list.item(i).setCheckState(state)
+
+    def start_run(self):
+        selected = [
+            copy.deepcopy(req) for i, req in enumerate(self.requests_list)
+            if self.request_list.item(i).checkState() == Qt.CheckState.Checked
+        ]
+        if not selected:
+            QMessageBox.information(self, "Run Collection", "Select at least one request.")
+            return
+        self.results = []
+        self.results_table.setRowCount(0)
+        self.details.clear()
+        self.env_name = self.env_combo.currentText()
+        iterations = self.iterations_spin.value()
+        self.progress.setRange(0, len(selected) * iterations)
+        self.progress.setValue(0)
+
+        panel = self.main.current_panel()
+        raw_timeout = panel.timeout_spin.value() if panel is not None else 30
+        self.worker = CollectionRunWorker(
+            selected,
+            dict(self.main.envs.get(self.env_name, {})),
+            iterations=iterations,
+            delay_ms=self.delay_spin.value(),
+            stop_on_failure=self.stop_on_failure_check.isChecked(),
+            timeout=raw_timeout or None,
+            cookie_jar=self.main.cookie_jar,
+            run_scripts=self.run_scripts_check.isChecked(),
+        )
+        self.worker.result.connect(self._on_result)
+        self.worker.variables.connect(self._on_variables)
+        self.worker.finished.connect(self._on_finished)
+        self._started_at = time.time()
+        self.run_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.export_btn.setEnabled(False)
+        self.summary_label.setText("Running…")
+        self.worker.start()
+
+    def stop_run(self):
+        if self.worker is not None:
+            self.worker.stop()
+            self.stop_btn.setEnabled(False)
+            self.summary_label.setText("Stopping after the current request…")
+
+    @staticmethod
+    def _row_outcome(row):
+        if row["error"]:
+            return "ERROR", QColor("#d9534f")
+        if any(not t["passed"] for t in row["tests"]):
+            return "FAIL", QColor("#dc3545")
+        return "PASS", QColor("#28a745")
+
+    def _on_result(self, row):
+        self.results.append(row)
+        r = self.results_table.rowCount()
+        self.results_table.insertRow(r)
+        passed = sum(1 for t in row["tests"] if t["passed"])
+        outcome, color = self._row_outcome(row)
+        cells = [
+            str(row["iteration"]), str(row["index"] + 1), f"{row['method']} {row['name']}",
+            "" if row["status"] is None else str(row["status"]),
+            "" if row["elapsed_ms"] is None else str(row["elapsed_ms"]),
+            f"{passed}/{len(row['tests'])}" if row["tests"] else "—",
+            outcome,
+        ]
+        for col, text in enumerate(cells):
+            item = QTableWidgetItem(text)
+            if col == 6:
+                item.setForeground(color)
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+            if col == 3 and row["status"] is not None:
+                item.setForeground(self.main._status_color(row["status"]))
+            self.results_table.setItem(r, col, item)
+        self.results_table.scrollToBottom()
+        self.progress.setValue(len(self.results))
+        self._update_summary(running=True)
+
+    def _on_variables(self, values):
+        if not self.save_vars_check.isChecked():
+            return
+        env = self.main.envs.setdefault(self.env_name, {})
+        env.update(values)
+        self.main.persist_envs()
+
+    def _on_finished(self):
+        self.run_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.export_btn.setEnabled(bool(self.results))
+        self._update_summary(running=False)
+        self.main.status_bar.showMessage(f"Collection run finished — {self.summary_label.text()}")
+
+    def _update_summary(self, running):
+        total_tests = sum(len(r["tests"]) for r in self.results)
+        passed_tests = sum(1 for r in self.results for t in r["tests"] if t["passed"])
+        errors = sum(1 for r in self.results if r["error"])
+        failed_requests = sum(1 for r in self.results if self._row_outcome(r)[0] != "PASS")
+        times = [r["elapsed_ms"] for r in self.results if r["elapsed_ms"] is not None]
+        avg = f"{sum(times) / len(times):.0f} ms avg" if times else "—"
+        prefix = "Running… " if running else ("Done. " if not failed_requests else "Finished with failures. ")
+        self.summary_label.setText(
+            f"{prefix}{len(self.results)} requests · {passed_tests}/{total_tests} tests passed · "
+            f"{failed_requests} failed ({errors} errors) · {avg} · {time.time() - self._started_at:.1f} s"
+        )
+
+    def _show_details(self, row_index):
+        if not 0 <= row_index < len(self.results):
+            return
+        row = self.results[row_index]
+        esc = _html.escape
+        parts = [f"<h3 style='margin:0;'>{esc(row['method'])} {esc(row['name'])}</h3>",
+                 f"<p style='color:#888;'>{esc(row['url'])}</p>"]
+        if row["error"]:
+            parts.append(f"<p style='color:#d9534f;'><b>Error:</b> {esc(row['error'])}</p>")
+        else:
+            parts.append(f"<p><b>Status:</b> {row['status']} {esc(row['reason'] or '')} · "
+                         f"<b>Time:</b> {row['elapsed_ms']} ms · <b>Size:</b> {row['size']:,} bytes</p>")
+        for t in row["tests"]:
+            icon, color = ("✔", "#28a745") if t["passed"] else ("✘", "#dc3545")
+            msg = f" <span style='color:#888;'>— {esc(t['message'])}</span>" if t["message"] else ""
+            parts.append(f"<div><b style='color:{color};'>{icon}</b> {esc(t['name'])}{msg}</div>")
+        for note in row["notes"]:
+            parts.append(f"<div style='color:#f0ad4e;'>⚠ {esc(note)}</div>")
+        if row["response_body"]:
+            parts.append(f"<pre>{esc(normalize_for_diff(row['response_body'], False)[:8000])}</pre>")
+        self.details.setHtml("".join(parts))
+
+    def export_results(self):
+        fname, chosen = QFileDialog.getSaveFileName(
+            self, "Export Run Results", str(Path.home() / f"{self.collection_name}-run.json"),
+            "JSON report (*.json);;JUnit XML (*.xml)",
+        )
+        if not fname:
+            return
+        try:
+            if fname.lower().endswith(".xml") or "JUnit" in chosen:
+                Path(fname).write_text(self._junit_xml(), encoding="utf-8")
+            else:
+                report = {
+                    "collection": self.collection_name,
+                    "environment": self.env_name,
+                    "finished_at": _dt.datetime.now().isoformat(timespec="seconds"),
+                    "results": [{k: v for k, v in r.items() if k != "response_body"} for r in self.results],
+                }
+                Path(fname).write_text(json.dumps(report, indent=2), encoding="utf-8")
+            self.main.status_bar.showMessage(f"Run results exported to {fname}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", str(e))
+
+    def _junit_xml(self):
+        from xml.sax.saxutils import escape, quoteattr
+        failures = sum(1 for r in self.results if not r["error"] and any(not t["passed"] for t in r["tests"]))
+        errors = sum(1 for r in self.results if r["error"])
+        total_time = sum((r["elapsed_ms"] or 0) for r in self.results) / 1000.0
+        suite = quoteattr(self.collection_name)
+        lines = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            f'<testsuites name={suite} tests="{len(self.results)}" failures="{failures}" '
+            f'errors="{errors}" time="{total_time:.3f}">',
+            f'  <testsuite name={suite} tests="{len(self.results)}" failures="{failures}" '
+            f'errors="{errors}" time="{total_time:.3f}">',
+        ]
+        for r in self.results:
+            name = quoteattr(f"{r['method']} {r['name']}")
+            classname = quoteattr(f"{self.collection_name}.iteration{r['iteration']}")
+            lines.append(f'    <testcase classname={classname} name={name} time="{(r["elapsed_ms"] or 0) / 1000.0:.3f}">')
+            if r["error"]:
+                lines.append(f'      <error message={quoteattr(r["error"])}/>')
+            failed = [t for t in r["tests"] if not t["passed"]]
+            if failed:
+                text = "\n".join(f"{t['name']}: {t['message']}" for t in failed)
+                lines.append(f'      <failure message={quoteattr(f"{len(failed)} assertion(s) failed")}>{escape(text)}</failure>')
+            lines.append('    </testcase>')
+        lines += ['  </testsuite>', '</testsuites>', '']
+        return "\n".join(lines)
+
+    def closeEvent(self, event):
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.stop()
+            _keep_thread_alive(self.worker)
+        super().closeEvent(event)
+
+
+# ---------------------------
+# GraphQL schema browser
+# ---------------------------
+class CallWorker(QThread):
+    """Sends one prepared call off the UI thread."""
+
+    done = pyqtSignal(object, float)
+    failed = pyqtSignal(str)
+
+    def __init__(self, call, cookie_jar=None):
+        super().__init__()
+        self.call = call
+        self.cookie_jar = cookie_jar
+
+    def run(self):
+        try:
+            response, elapsed = execute_call(self.call, self.cookie_jar)
+            self.done.emit(response, elapsed)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class GraphQLSchemaDialog(QDialog):
+    operationChosen = pyqtSignal(str, object)
+
+    def __init__(self, call, cookie_jar, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("GraphQL Schema")
+        self.resize(760, 620)
+        self.schema = None
+
+        layout = QVBoxLayout(self)
+        self.status_label = QLabel(f"Introspecting {call['url']} …")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        self.filter_input = QLineEdit()
+        self.filter_input.setPlaceholderText("Filter operations…")
+        self.filter_input.setClearButtonEnabled(True)
+        self.filter_input.textChanged.connect(self._apply_filter)
+        layout.addWidget(self.filter_input)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Operation", "Returns"])
+        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.tree.itemDoubleClicked.connect(lambda item, _col: self._choose(item))
+        self.tree.currentItemChanged.connect(self._show_description)
+        layout.addWidget(self.tree, 1)
+
+        self.description = QLabel("")
+        self.description.setWordWrap(True)
+        self.description.setStyleSheet("color:#888;")
+        layout.addWidget(self.description)
+
+        buttons = QHBoxLayout()
+        insert_btn = QPushButton("Use Operation")
+        insert_btn.setToolTip("Replace the request body with a query for the selected operation (or double-click it).")
+        insert_btn.clicked.connect(lambda: self._choose(self.tree.currentItem()))
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        buttons.addWidget(insert_btn)
+        buttons.addStretch()
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+        self.worker = CallWorker(call, cookie_jar)
+        self.worker.done.connect(self._on_done)
+        self.worker.failed.connect(lambda msg: self.status_label.setText(f"Introspection failed: {msg}"))
+        self.worker.start()
+
+    def _on_done(self, response, _elapsed):
+        try:
+            payload = response.json()
+        except Exception:
+            self.status_label.setText(f"HTTP {response.status_code}: the endpoint did not return JSON.")
+            return
+        schema = ((payload or {}).get("data") or {}).get("__schema")
+        if not schema:
+            errors = (payload or {}).get("errors") or []
+            msg = errors[0].get("message") if errors and isinstance(errors[0], dict) else f"HTTP {response.status_code}"
+            self.status_label.setText(f"No schema returned ({msg}). Introspection may be disabled on this server.")
+            return
+        self.schema = schema
+        types = {t["name"]: t for t in schema.get("types") or [] if t.get("name")}
+        count = 0
+        for root_kind, key in (("query", "queryType"), ("mutation", "mutationType"), ("subscription", "subscriptionType")):
+            root_name = (schema.get(key) or {}).get("name")
+            root_type = types.get(root_name)
+            if not root_type:
+                continue
+            root_item = QTreeWidgetItem([f"{root_kind.capitalize()} ({root_name})", ""])
+            font = root_item.font(0)
+            font.setBold(True)
+            root_item.setFont(0, font)
+            for field in sorted(root_type.get("fields") or [], key=lambda f: f["name"]):
+                args = ", ".join(f"{a['name']}: {graphql_type_str(a['type'])}" for a in field.get("args") or [])
+                item = QTreeWidgetItem([f"{field['name']}({args})" if args else field["name"],
+                                        graphql_type_str(field.get("type"))])
+                item.setData(0, Qt.ItemDataRole.UserRole, (root_kind, field))
+                root_item.addChild(item)
+                count += 1
+            self.tree.addTopLevelItem(root_item)
+        self.tree.expandAll()
+        self.status_label.setText(f"{count} operations. Double-click one to build a query.")
+
+    def _apply_filter(self, text):
+        text = text.strip().lower()
+        for i in range(self.tree.topLevelItemCount()):
+            root = self.tree.topLevelItem(i)
+            for j in range(root.childCount()):
+                child = root.child(j)
+                child.setHidden(bool(text) and text not in child.text(0).lower())
+
+    def _show_description(self, item, _previous=None):
+        data = item.data(0, Qt.ItemDataRole.UserRole) if item else None
+        self.description.setText((data[1].get("description") or "") if data else "")
+
+    def _choose(self, item):
+        data = item.data(0, Qt.ItemDataRole.UserRole) if item else None
+        if not data or not self.schema:
+            return
+        root_kind, field = data
+        query, variables = graphql_operation_for_field(self.schema, root_kind, field)
+        self.operationChosen.emit(query, variables)
+        self.close()
+
+    def closeEvent(self, event):
+        _keep_thread_alive(self.worker)
+        super().closeEvent(event)
+
+
+# ---------------------------
+# WebSocket / Server-Sent Events console
+# ---------------------------
+class WebSocketWorker(QThread):
+    message = pyqtSignal(str, str)  # direction ("in", "out", "info"), text
+    connected = pyqtSignal(str)
+    closed = pyqtSignal(str)
+
+    def __init__(self, url, headers, verify_ssl=True):
+        super().__init__()
+        self.url = url
+        self.headers = headers
+        self.verify_ssl = verify_ssl
+        self.ws = None
+        self._stopping = False
+
+    def run(self):
+        sslopt = None if self.verify_ssl else {"cert_reqs": ssl.CERT_NONE, "check_hostname": False}
+        try:
+            self.ws = websocket.create_connection(
+                self.url, header=[f"{k}: {v}" for k, v in self.headers.items()],
+                sslopt=sslopt, timeout=15,
+            )
+        except Exception as e:
+            self.closed.emit(f"Connection failed: {e}")
+            return
+        self.ws.settimeout(None)
+        self.connected.emit(f"Connected to {self.url}")
+        reason = "Disconnected"
+        try:
+            while True:
+                opcode, data = self.ws.recv_data()
+                if opcode == websocket.ABNF.OPCODE_TEXT:
+                    self.message.emit("in", data.decode("utf-8", "replace"))
+                elif opcode == websocket.ABNF.OPCODE_BINARY:
+                    preview = base64.b64encode(data[:48]).decode("ascii")
+                    self.message.emit("in", f"<binary {len(data):,} bytes> {preview}{'…' if len(data) > 48 else ''}")
+                elif opcode == websocket.ABNF.OPCODE_CLOSE:
+                    reason = "Server closed the connection"
+                    break
+        except Exception as e:
+            if not self._stopping:
+                reason = f"Connection lost: {e}"
+        finally:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+        self.closed.emit(reason)
+
+    def send(self, text):
+        # websocket-client serialises sends with its own lock, so this is safe
+        # to call from the UI thread while run() is blocked in recv.
+        if self.ws is None:
+            return
+        try:
+            self.ws.send(text)
+            self.message.emit("out", text)
+        except Exception as e:
+            self.message.emit("info", f"Send failed: {e}")
+
+    def stop(self):
+        self._stopping = True
+        if self.ws is not None:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+
+
+class SSEWorker(QThread):
+    message = pyqtSignal(str, str)
+    connected = pyqtSignal(str)
+    closed = pyqtSignal(str)
+
+    def __init__(self, url, headers, verify_ssl=True):
+        super().__init__()
+        self.url = url
+        self.headers = headers
+        self.verify_ssl = verify_ssl
+        self._response = None
+        self._stopping = False
+
+    def run(self):
+        headers = {"Accept": "text/event-stream", "Cache-Control": "no-cache"}
+        headers.update(self.headers)
+        reason = "Stream ended"
+        try:
+            with requests.get(self.url, headers=headers, stream=True, timeout=(15, None),
+                              verify=self.verify_ssl) as resp:
+                self._response = resp
+                if resp.status_code >= 400:
+                    self.closed.emit(f"HTTP {resp.status_code} {resp.reason}: {resp.text[:300]}")
+                    return
+                resp.encoding = resp.encoding or "utf-8"
+                self.connected.emit(f"HTTP {resp.status_code} — {resp.headers.get('Content-Type', '')}")
+                event, event_id, data_lines = "", "", []
+                for line in resp.iter_lines(chunk_size=None, decode_unicode=True):
+                    if self._stopping:
+                        break
+                    if line is None:
+                        continue
+                    if line == "":
+                        if data_lines:
+                            label = (event or "message") + (f" #{event_id}" if event_id else "")
+                            self.message.emit("in", f"[{label}] " + "\n".join(data_lines))
+                        event, data_lines = "", []
+                        continue
+                    if line.startswith(":"):
+                        continue  # comment / keep-alive
+                    field, _, value = line.partition(":")
+                    if value.startswith(" "):
+                        value = value[1:]
+                    if field == "data":
+                        data_lines.append(value)
+                    elif field == "event":
+                        event = value
+                    elif field == "id":
+                        event_id = value
+        except Exception as e:
+            if not self._stopping:
+                reason = f"Connection lost: {e}"
+        self.closed.emit("Disconnected" if self._stopping else reason)
+
+    def stop(self):
+        self._stopping = True
+        if self._response is not None:
+            try:
+                self._response.close()
+            except Exception:
+                pass
+
+
+class RealtimeConsoleDialog(QDialog):
+    MODES = ["WebSocket", "Server-Sent Events"]
+
+    def __init__(self, url, headers_text, env, verify_ssl=True, parent=None):
+        super().__init__(parent)
+        self.env = env
+        self.verify_ssl = verify_ssl
+        self.worker = None
+        self.setWindowTitle("WebSocket / SSE Console")
+        self.resize(900, 680)
+
+        layout = QVBoxLayout(self)
+        top = QHBoxLayout()
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(self.MODES)
+        self.url_input = QLineEdit(url)
+        self.url_input.setPlaceholderText("wss://example.com/socket  or  https://example.com/events")
+        self.connect_btn = QPushButton("Connect")
+        self.connect_btn.setObjectName("send_btn")
+        self.connect_btn.setFixedWidth(110)
+        self.connect_btn.clicked.connect(self.toggle_connection)
+        top.addWidget(self.mode_combo)
+        top.addWidget(self.url_input, 1)
+        top.addWidget(self.connect_btn)
+        layout.addLayout(top)
+
+        self.mode_combo.setCurrentText("WebSocket" if url.lower().startswith(("ws://", "wss://")) else "Server-Sent Events")
+        self.mode_combo.currentTextChanged.connect(self._on_mode_changed)
+
+        layout.addWidget(QLabel("Headers (Key: Value, {{VARS}} resolved on connect):"))
+        self.headers_text = QPlainTextEdit(headers_text)
+        self.headers_text.setMaximumHeight(70)
+        layout.addWidget(self.headers_text)
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setFont(_monospace_font(9))
+        layout.addWidget(self.log, 1)
+
+        self.send_group = QGroupBox("Send message")
+        send_layout = QHBoxLayout(self.send_group)
+        self.send_text = QPlainTextEdit()
+        self.send_text.setMaximumHeight(80)
+        self.send_text.setPlaceholderText('{"type": "ping"}   — Ctrl+Enter to send')
+        self.send_btn = QPushButton("Send")
+        self.send_btn.setEnabled(False)
+        self.send_btn.clicked.connect(self.send_message)
+        send_layout.addWidget(self.send_text, 1)
+        send_layout.addWidget(self.send_btn)
+        layout.addWidget(self.send_group)
+        QShortcut(QKeySequence("Ctrl+Return"), self.send_text, activated=self.send_message)
+
+        bottom = QHBoxLayout()
+        self.pretty_check = QCheckBox("Pretty-print JSON")
+        self.pretty_check.setChecked(True)
+        self.status_label = QLabel("Disconnected")
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(self.log.clear)
+        save_btn = QPushButton("Save Log…")
+        save_btn.clicked.connect(self.save_log)
+        bottom.addWidget(self.status_label, 1)
+        bottom.addWidget(self.pretty_check)
+        bottom.addWidget(clear_btn)
+        bottom.addWidget(save_btn)
+        layout.addLayout(bottom)
+        self._on_mode_changed(self.mode_combo.currentText())
+
+    def _on_mode_changed(self, mode):
+        url = self.url_input.text().strip()
+        if mode == "WebSocket":
+            url = re.sub(r"^http(s?)://", r"ws\1://", url, flags=re.I)
+        else:
+            url = re.sub(r"^ws(s?)://", r"http\1://", url, flags=re.I)
+        self.url_input.setText(url)
+        self.send_group.setVisible(mode == "WebSocket")
+
+    def toggle_connection(self):
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.stop()
+            self.connect_btn.setEnabled(False)
+            return
+        url = apply_env(self.url_input.text().strip(), self.env)
+        if not url:
+            return
+        headers = parse_header_lines(self.headers_text.toPlainText(), self.env)
+        if self.mode_combo.currentText() == "WebSocket":
+            if websocket is None:
+                QMessageBox.warning(self, "WebSocket", "WebSocket support needs the websocket-client package:\n\n"
+                                                       "pip install websocket-client")
+                return
+            self.worker = WebSocketWorker(url, headers, self.verify_ssl)
+        else:
+            self.worker = SSEWorker(url, headers, self.verify_ssl)
+        self.worker.message.connect(self._append)
+        self.worker.connected.connect(self._on_connected)
+        self.worker.closed.connect(self._on_closed)
+        self.mode_combo.setEnabled(False)
+        self.connect_btn.setText("Disconnect")
+        self.status_label.setText(f"Connecting to {url} …")
+        self._append("info", f"Connecting to {url}")
+        self.worker.start()
+
+    def _on_connected(self, text):
+        self.status_label.setText(text)
+        self._append("info", text)
+        self.send_btn.setEnabled(isinstance(self.worker, WebSocketWorker))
+
+    def _on_closed(self, reason):
+        self._append("info", reason)
+        self.status_label.setText(reason)
+        self.connect_btn.setText("Connect")
+        self.connect_btn.setEnabled(True)
+        self.send_btn.setEnabled(False)
+        self.mode_combo.setEnabled(True)
+
+    def _append(self, direction, text):
+        arrow = {"in": "↓", "out": "↑"}.get(direction, "•")
+        if self.pretty_check.isChecked() and direction in ("in", "out"):
+            prefix, sep, rest = text.partition("] ") if text.startswith("[") else ("", "", text)
+            try:
+                rest = json.dumps(json.loads(rest), indent=2, ensure_ascii=False)
+                text = f"{prefix}{sep}{rest}"
+            except Exception:
+                pass
+        stamp = time.strftime("%H:%M:%S")
+        self.log.appendPlainText(f"{stamp}  {arrow}  {text}")
+
+    def send_message(self):
+        if not isinstance(self.worker, WebSocketWorker) or not self.send_btn.isEnabled():
+            return
+        text = apply_env(self.send_text.toPlainText(), self.env)
+        if text:
+            self.worker.send(text)
+
+    def save_log(self):
+        fname, _ = QFileDialog.getSaveFileName(self, "Save Log", str(Path.home() / "realtime-log.txt"),
+                                               "Text Files (*.txt);;All Files (*)")
+        if fname:
+            try:
+                Path(fname).write_text(self.log.toPlainText(), encoding="utf-8")
+            except Exception as e:
+                QMessageBox.critical(self, "Save Error", str(e))
+
+    def closeEvent(self, event):
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.stop()
+            _keep_thread_alive(self.worker)
+        super().closeEvent(event)
+
+
 # ---------------------------
 # Main window
 # ---------------------------
@@ -5040,7 +7425,7 @@ class CurlPyProMainWindow(QMainWindow):
             "proxy_bypass": "",
         })
         self.history = load_history()
-        self.envs = load_document("envs", {"default": {}})
+        self.envs, self.env_secrets = load_envs()
         self.collections = load_document("collections", {})
         self.cookie_jar = list_to_cookiejar(load_document("cookies", []))
 
@@ -5079,18 +7464,24 @@ class CurlPyProMainWindow(QMainWindow):
         collections_toolbar = QHBoxLayout()
         btn_new_collection = QPushButton("New")
         btn_import_collection = QPushButton("Import")
+        btn_import_collection.setToolTip("Import a CurlPyPro export, a Postman collection or environment, "
+                                         "or an OpenAPI/Swagger spec (JSON or YAML)")
         btn_export_collection = QPushButton("Export")
+        btn_run_collection = QPushButton("Run")
+        btn_run_collection.setToolTip("Run the selected collection with its tests")
 
-        for b in (btn_new_collection, btn_import_collection, btn_export_collection):
+        for b in (btn_new_collection, btn_import_collection, btn_export_collection, btn_run_collection):
             b.setFixedHeight(34)
 
         btn_new_collection.clicked.connect(self.create_collection)
         btn_import_collection.clicked.connect(self.import_collection)
         btn_export_collection.clicked.connect(self.export_collection)
+        btn_run_collection.clicked.connect(self.run_selected_collection)
 
         collections_toolbar.addWidget(btn_new_collection)
         collections_toolbar.addWidget(btn_import_collection)
         collections_toolbar.addWidget(btn_export_collection)
+        collections_toolbar.addWidget(btn_run_collection)
         collections_toolbar.addStretch()
 
         btn_coll_expand = QToolButton()
@@ -5110,6 +7501,8 @@ class CurlPyProMainWindow(QMainWindow):
         self.collections_tree = QTreeWidget()
         self.collections_tree.setHeaderLabel("Collections")
         self.collections_tree.itemDoubleClicked.connect(self.load_collection_item)
+        self.collections_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.collections_tree.customContextMenuRequested.connect(self.show_collection_context_menu)
         collections_layout.addWidget(self.collections_tree)
 
         left_layout.addWidget(collections_group)
@@ -5429,13 +7822,31 @@ class CurlPyProMainWindow(QMainWindow):
             return QColor("#f0ad4e")
         return QColor("#d9534f")
 
+    def persist_envs(self):
+        """Save environments; secret variables go to the OS keychain."""
+        failed = save_envs(self.envs, self.env_secrets)
+        if failed:
+            self.status_bar.showMessage(
+                f"Couldn't store {', '.join(failed)} in the OS keychain; saved in the local database instead."
+            )
+
+    def refresh_env_combo(self):
+        current = self.env_combo.currentText()
+        self.env_combo.blockSignals(True)
+        self.env_combo.clear()
+        self.env_combo.addItems(list(self.envs.keys()))
+        if current in self.envs:
+            self.env_combo.setCurrentText(current)
+        self.env_combo.blockSignals(False)
+
     def manage_environments(self):
-        dlg = EnvironmentDialog(self.envs, self)
+        # Edit a copy so Cancel really discards changes.
+        dlg = EnvironmentDialog(copy.deepcopy(self.envs), self, self.env_secrets)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.envs = dlg.envs
-            save_document("envs", self.envs)
-            self.env_combo.clear()
-            self.env_combo.addItems(list(self.envs.keys()))
+            self.env_secrets = dlg.secrets
+            self.persist_envs()
+            self.refresh_env_combo()
             QMessageBox.information(self, "Environments", "Environments saved.")
 
     def load_collection_item(self, item, col):
@@ -5475,6 +7886,7 @@ class CurlPyProMainWindow(QMainWindow):
         menu.addAction("Copy as cURL", lambda: self._history_copy_curl(data))
         menu.addAction("Copy Response Body", lambda: self._history_copy_response(data))
         menu.addAction("View Response Body…", lambda: self._history_view_response(data))
+        menu.addAction("Compare with Current Response", lambda: self._history_compare(data))
         menu.addSeparator()
         menu.addAction("Delete Entry", lambda: self.delete_history_entry(data))
         menu.exec(self.history_tree.viewport().mapToGlobal(pos))
@@ -5532,6 +7944,14 @@ class CurlPyProMainWindow(QMainWindow):
         QApplication.clipboard().setText(body)
         self.status_bar.showMessage("Response body copied to clipboard")
 
+    def _history_compare(self, data):
+        panel = self.current_panel()
+        if panel is None:
+            return
+        body = data.get("response_body_full") or data.get("response_body_snippet", "") or ""
+        stamp = time.strftime("%H:%M:%S", time.localtime(data.get("timestamp", 0)))
+        panel.show_diff_against(f"history {data.get('method', '')} ({data.get('status', '')}, {stamp})", body)
+
     def _history_view_response(self, data):
         body = data.get("response_body_full") or data.get("response_body_snippet", "") or "(no response body stored)"
         title = f"Response {data.get('status', '')} — {(data.get('url', '') or '')[:60]}"
@@ -5551,25 +7971,138 @@ class CurlPyProMainWindow(QMainWindow):
         QMessageBox.information(self, "Created", f"Collection '{name}' created.")
 
     def import_collection(self):
-        fname, _ = QFileDialog.getOpenFileName(self, "Import Collection", str(Path.home()), "JSON Files (*.json)")
+        fname, _ = QFileDialog.getOpenFileName(
+            self, "Import Collection", str(Path.home()),
+            "Collections and API specs (*.json *.yaml *.yml);;All Files (*)",
+        )
         if not fname:
             return
         try:
-            data = json.loads(Path(fname).read_text())
-            if isinstance(data, dict):
-                for k, v in data.items():
-                    if k in self.collections and isinstance(v, list):
-                        self.collections[k].extend(v)
-                    else:
-                        self.collections[k] = v
-            elif isinstance(data, list):
-                name = Path(fname).stem
-                self.collections.setdefault(name, []).extend(data)
-            save_document("collections", self.collections)
-            self.reload_collections()
-            QMessageBox.information(self, "Imported", f"Imported collections from {fname}")
+            data = parse_import_text(Path(fname).read_text(encoding="utf-8-sig"))
+            result = import_any(data)
         except Exception as e:
             QMessageBox.critical(self, "Import Error", str(e))
+            return
+
+        added_collections, added_requests = [], 0
+        for name, items in result["collections"].items():
+            if not isinstance(items, list):
+                continue
+            if name is None:  # a bare list of requests: name it after the file
+                name = Path(fname).stem
+                self.collections.setdefault(name, []).extend(items)
+            elif detect_import_format(data) == "curlpypro" and name in self.collections:
+                self.collections[name].extend(items)
+            else:
+                base, n = name, 2
+                while name in self.collections:
+                    name = f"{base} ({n})"
+                    n += 1
+                self.collections[name] = items
+            added_collections.append(name)
+            added_requests += len(items)
+
+        added_envs = []
+        for env_name, variables in result["environments"].items():
+            env = self.envs.setdefault(env_name, {})
+            for key, value in variables.items():
+                if not env.get(key):  # never overwrite a value the user already set
+                    env[key] = value
+            added_envs.append(env_name)
+
+        save_document("collections", self.collections)
+        self.reload_collections()
+        if added_envs:
+            self.persist_envs()
+            self.refresh_env_combo()
+
+        lines = []
+        if added_collections:
+            lines.append(f"{added_requests} request(s) into: {', '.join(added_collections)}")
+        if added_envs:
+            lines.append(f"Environment(s): {', '.join(added_envs)}")
+        if result["warnings"]:
+            shown = result["warnings"][:8]
+            more = len(result["warnings"]) - len(shown)
+            lines.append("\nNotes:\n• " + "\n• ".join(shown) + (f"\n…and {more} more" if more else ""))
+        QMessageBox.information(self, "Imported", "\n".join(lines) or "Nothing to import.")
+
+    def _selected_collection_name(self):
+        item = self.collections_tree.currentItem()
+        meta = item.data(0, Qt.ItemDataRole.UserRole) if item else None
+        if not meta:
+            return None
+        return meta.get("name") if meta.get("type") == "collection" else meta.get("collection")
+
+    def run_selected_collection(self, name=None):
+        name = name or self._selected_collection_name()
+        if not name and len(self.collections) == 1:
+            name = next(iter(self.collections))
+        if not name:
+            QMessageBox.information(self, "Run Collection", "Select a collection to run.")
+            return
+        if not self.collections.get(name):
+            QMessageBox.information(self, "Run Collection", f"'{name}' has no requests yet.")
+            return
+        dlg = CollectionRunnerDialog(self, name)
+        dlg.show()
+
+    def show_collection_context_menu(self, pos):
+        item = self.collections_tree.itemAt(pos)
+        meta = item.data(0, Qt.ItemDataRole.UserRole) if item else None
+        if not meta:
+            return
+        menu = QMenu(self)
+        if meta.get("type") == "collection":
+            name = meta.get("name")
+            menu.addAction("Run Collection…", lambda: self.run_selected_collection(name))
+            menu.addAction("Rename…", lambda: self._rename_collection(name))
+            menu.addSeparator()
+            menu.addAction("Delete Collection", lambda: self._delete_collection(name))
+        else:
+            coll, idx = meta.get("collection"), meta.get("index")
+            menu.addAction("Open in New Tab", lambda: self._open_collection_request(coll, idx))
+            menu.addSeparator()
+            menu.addAction("Delete Request", lambda: self._delete_collection_request(coll, idx))
+        menu.exec(self.collections_tree.viewport().mapToGlobal(pos))
+
+    def _open_collection_request(self, coll, idx):
+        try:
+            self.new_tab(from_data=self.collections[coll][idx])
+        except (KeyError, IndexError):
+            pass
+
+    def _rename_collection(self, name):
+        new_name, ok = QInputDialog.getText(self, "Rename Collection", "New name:", text=name)
+        new_name = (new_name or "").strip()
+        if not ok or not new_name or new_name == name:
+            return
+        if new_name in self.collections:
+            QMessageBox.warning(self, "Exists", "A collection with that name already exists.")
+            return
+        self.collections = {(new_name if k == name else k): v for k, v in self.collections.items()}
+        save_document("collections", self.collections)
+        self.reload_collections()
+
+    def _delete_collection(self, name):
+        count = len(self.collections.get(name, []))
+        reply = QMessageBox.question(self, "Delete Collection",
+                                     f"Delete collection '{name}' and its {count} request(s)?")
+        if reply == QMessageBox.StandardButton.Yes:
+            self.collections.pop(name, None)
+            save_document("collections", self.collections)
+            self.reload_collections()
+
+    def _delete_collection_request(self, coll, idx):
+        try:
+            req = self.collections[coll][idx]
+        except (KeyError, IndexError):
+            return
+        reply = QMessageBox.question(self, "Delete Request", f"Delete '{req.get('name', 'request')}' from '{coll}'?")
+        if reply == QMessageBox.StandardButton.Yes:
+            del self.collections[coll][idx]
+            save_document("collections", self.collections)
+            self.reload_collections()
 
     def export_collection(self):
         selected = self.collections_tree.currentItem()
@@ -5605,7 +8138,7 @@ class CurlPyProMainWindow(QMainWindow):
                 self.settings["request_timeout"] = panel.timeout_spin.value()
                 self.settings.update(panel._advanced_snapshot())
             save_document("settings", self.settings)
-            save_document("envs", self.envs)
+            self.persist_envs()
             save_document("collections", self.collections)
             save_document("cookies", cookiejar_to_list(self.cookie_jar))
             save_document("workspace_tabs", {

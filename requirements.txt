@@ -3,3 +3,7 @@
 PyQt6>=6.6,<7
 PyQt6-WebEngine>=6.6,<7
 requests>=2.32,<3
+# Optional features (the app still runs without them):
+PyYAML>=6,<7                 # import OpenAPI/Swagger specs written in YAML
+websocket-client>=1.7,<2     # WebSocket console
+keyring>=25,<26              # store secret environment variables in the OS keychain

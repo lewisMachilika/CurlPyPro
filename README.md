@@ -36,22 +36,32 @@ keeps everything in one local SQLite file you control.
 - Any HTTP method, multiple request tabs
 - Query-parameter table with enable/disable per row (auto-extracted from the URL)
 - Headers, raw/JSON body, and `multipart/form-data` file and image uploads
+- **GraphQL** body mode with a variables editor and a schema browser that
+  builds queries from introspection
 - Paste a `curl` command into the URL bar to import it
 
 ### Auth
 
 - Bearer token, Basic auth, API key (header or query)
-- OAuth 2.0 token fetching
+- OAuth 2.0 (client credentials, password, authorization code)
 
 ### Environments
 
 - `{{VAR}}` substitution in URL, params, headers, auth and body
 - Switch between environments (dev / staging / prod) in one click
+- **Request chaining:** capture a value from a response (JSON path, header,
+  status or regex) into a variable that later requests use, e.g. log in once
+  and reuse `{{TOKEN}}` everywhere
+- **Secrets in the OS keychain:** mark a variable as secret and its value is
+  stored in Windows Credential Manager, macOS Keychain or Secret Service
+  instead of the local database
 
 ### Inspect responses
 
 - Status, timing, size, and headers
 - Pretty-printed JSON, HTML and XML; image and HTML previews
+- **Diff** each response against the previous one (or any history entry),
+  ignoring JSON key order
 - Save raw responses, extract base64 payloads, export HAR files
 
 ### Transport control
@@ -59,6 +69,27 @@ keeps everything in one local SQLite file you control.
 - Redirects, SSL verification, timeouts, and automatic retries
 - Proxy support, including the Windows system proxy and PAC setups
 - Cookie jar viewer and editor
+
+### Test and automate
+
+- **Assertions** on status, response time, headers, body size, body text and
+  JSON paths (`$.data.items[0].id`, `$.items.length`), with quick-add presets
+- **Collection runner:** run a whole collection in order with iterations,
+  delays and stop-on-failure; export results as JSON or **JUnit XML** for CI
+- Post-response Python scripts that can read the response and update variables
+
+### Import
+
+- **Postman** collections (v2.0 / v2.1) and environments, including folders,
+  auth inheritance, path variables and simple status tests
+- **OpenAPI 3** and **Swagger 2** specs in JSON or YAML: every operation becomes
+  a request with example bodies, query params and auth, plus a `{{baseUrl}}`
+  environment
+
+### Realtime
+
+- **WebSocket** console: connect, send and receive messages with pretty-printed JSON
+- **Server-Sent Events** viewer that parses event names, ids and data
 
 ### Productivity
 
@@ -105,6 +136,7 @@ python curlpypro.py
 | `Ctrl+W`       | Close current tab     |
 | `Delete`       | Delete selected history entry |
 | `Ctrl+Shift+C` | Copy current snippet (in the snippet dialog) |
+| `Ctrl+Enter`   | Send message (in the WebSocket console) |
 
 ## Where is my data?
 
@@ -112,8 +144,10 @@ Everything lives in `~/.curlpypro/curlpypro.db` (SQLite): history, collections,
 environments, cookies and settings. Back up or copy that file to move your
 workspace to another machine.
 
-> Tokens and passwords are stored **unencrypted** in that file. See
-> [SECURITY.md](SECURITY.md).
+Environment variables marked **Secret** are the exception: their values live in
+your OS keychain under the service name `CurlPyPro`, so they don't travel with
+the database file. Everything else, including auth fields typed directly into a
+request and stored history, is saved **unencrypted**. See [SECURITY.md](SECURITY.md).
 
 ## Build a standalone app
 
@@ -150,14 +184,16 @@ git push origin v1.0.0
 Ideas being considered. Upvote or discuss them in
 [Issues](https://github.com/lewisMachilika/CurlPyPro/issues):
 
-- [ ] Response tests and assertions (status, JSON path, headers) with a collection runner
-- [ ] Import Postman collections and OpenAPI/Swagger specs
-- [ ] GraphQL body mode with schema introspection
-- [ ] WebSocket and Server-Sent Events support
-- [ ] Response diff between two runs
-- [ ] Chain requests: capture a value from one response into an environment variable
-- [ ] Encrypted storage for secrets (OS keychain)
+- [x] Response tests and assertions with a collection runner
+- [x] Import Postman collections and OpenAPI/Swagger specs
+- [x] GraphQL body mode with schema introspection
+- [x] WebSocket and Server-Sent Events support
+- [x] Response diff between two runs
+- [x] Chain requests by capturing response values into variables
+- [x] Secrets in the OS keychain
 - [ ] Command-line runner for CI pipelines
+- [ ] Export collections back to Postman format
+- [ ] Automated test suite and linting in CI
 
 ## Contributing
 
