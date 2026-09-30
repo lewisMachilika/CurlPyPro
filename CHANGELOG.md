@@ -14,6 +14,10 @@ and the project uses [Semantic Versioning](https://semver.org/).
 - **Collection runner:** run a collection with iterations, delay and
   stop-on-failure; export results as JSON or JUnit XML. Collections gained a
   right-click menu (run, rename, delete, open in new tab).
+- **Command-line runner:** `curlpypro run` runs a saved collection or a
+  CurlPyPro/Postman/OpenAPI file with environments, `--var` overrides and
+  JUnit/JSON reports; exit codes 0 (pass), 1 (failures), 2 (usage error).
+  Also `curlpypro --version`.
 - **Import** Postman v2.0/v2.1 collections and environments, and OpenAPI 3 /
   Swagger 2 specs in JSON or YAML.
 - **GraphQL** body mode with a variables editor and an introspection-based

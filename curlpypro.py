@@ -6565,23 +6565,27 @@ def compile_post_response_script(code):
 # ---------------------------
 # Collection runner
 # ---------------------------
-class CollectionRunWorker(QThread):
-    """Runs a list of saved requests in order, with captures, scripts and assertions."""
+class CollectionRunner:
+    """Runs a list of saved requests in order, with captures, scripts and assertions.
 
-    result = pyqtSignal(dict)
-    variables = pyqtSignal(dict)
+    Plain Python (no Qt), so the GUI worker and the command-line runner share it.
+    `on_result(row)` is called after every request and `on_variables(dict)`
+    whenever captures or scripts change variables.
+    """
 
     def __init__(self, requests_list, env, iterations=1, delay_ms=0, stop_on_failure=False,
-                 timeout=30, cookie_jar=None, run_scripts=True):
-        super().__init__()
+                 timeout=30, cookie_jar=None, run_scripts=True, on_result=None, on_variables=None):
         self.requests_list = requests_list
-        self.env = env  # a private copy; changes are reported through `variables`
+        self.env = env  # mutated as captures/scripts run
         self.iterations = max(1, iterations)
         self.delay_ms = delay_ms
         self.stop_on_failure = stop_on_failure
         self.timeout = timeout
         self.cookie_jar = cookie_jar
         self.run_scripts = run_scripts
+        self.on_result = on_result or (lambda row: None)
+        self.on_variables = on_variables or (lambda values: None)
+        self.results = []
         self._stop = False
         self._tokens = {}
 
@@ -6612,7 +6616,7 @@ class CollectionRunWorker(QThread):
             row["notes"].append(f"Post-response script error: {e}")
         changed = {k: v for k, v in self.env.items() if before.get(k) != v}
         if changed:
-            self.variables.emit(changed)
+            self.on_variables(changed)
 
     def _sleep(self):
         end = time.time() + self.delay_ms / 1000.0
@@ -6620,10 +6624,11 @@ class CollectionRunWorker(QThread):
             time.sleep(0.05)
 
     def run(self):
+        """Run every request for every iteration. Returns the list of result rows."""
         for iteration in range(1, self.iterations + 1):
             for index, req in enumerate(self.requests_list):
                 if self._stop:
-                    return
+                    return self.results
                 row = {
                     "iteration": iteration, "index": index,
                     "name": req.get("name") or f"Request {index + 1}",
@@ -6652,7 +6657,7 @@ class CollectionRunWorker(QThread):
                     values, problems = extract_captures(req.get("captures"), response)
                     if values:
                         self.env.update(values)
-                        self.variables.emit(values)
+                        self.on_variables(values)
                     row["notes"].extend(problems)
                     self._run_script(req, response, elapsed, row)
                     row["tests"] = evaluate_assertions(req.get("tests"), response, elapsed * 1000, self.env)
@@ -6660,13 +6665,89 @@ class CollectionRunWorker(QThread):
                     row["error"] = f"{e.title}: {e}"
                 except Exception as e:
                     row["error"] = str(e)
-                self.result.emit(row)
+                self.results.append(row)
+                self.on_result(row)
 
-                failed = bool(row["error"]) or any(not t["passed"] for t in row["tests"])
-                if failed and self.stop_on_failure:
-                    return
+                if run_outcome(row) != "PASS" and self.stop_on_failure:
+                    return self.results
                 if self.delay_ms:
                     self._sleep()
+        return self.results
+
+
+def run_outcome(row):
+    """PASS, FAIL (an assertion failed) or ERROR (the request itself failed)."""
+    if row["error"]:
+        return "ERROR"
+    if any(not t["passed"] for t in row["tests"]):
+        return "FAIL"
+    return "PASS"
+
+
+def results_to_report(collection_name, env_name, results):
+    """JSON-serialisable run report (response bodies left out)."""
+    return {
+        "collection": collection_name,
+        "environment": env_name,
+        "finished_at": _dt.datetime.now().isoformat(timespec="seconds"),
+        "summary": {
+            "requests": len(results),
+            "failed": sum(1 for r in results if run_outcome(r) == "FAIL"),
+            "errors": sum(1 for r in results if run_outcome(r) == "ERROR"),
+            "tests": sum(len(r["tests"]) for r in results),
+            "tests_passed": sum(1 for r in results for t in r["tests"] if t["passed"]),
+        },
+        "results": [{k: v for k, v in r.items() if k != "response_body"} for r in results],
+    }
+
+
+def results_to_junit(suite_name, results):
+    """JUnit XML: one testcase per request run, assertion failures as <failure>."""
+    from xml.sax.saxutils import escape, quoteattr
+    failures = sum(1 for r in results if run_outcome(r) == "FAIL")
+    errors = sum(1 for r in results if run_outcome(r) == "ERROR")
+    total_time = sum((r["elapsed_ms"] or 0) for r in results) / 1000.0
+    suite = quoteattr(suite_name)
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<testsuites name={suite} tests="{len(results)}" failures="{failures}" '
+        f'errors="{errors}" time="{total_time:.3f}">',
+        f'  <testsuite name={suite} tests="{len(results)}" failures="{failures}" '
+        f'errors="{errors}" time="{total_time:.3f}">',
+    ]
+    for r in results:
+        name = quoteattr(f"{r['method']} {r['name']}")
+        classname = quoteattr(f"{suite_name}.iteration{r['iteration']}")
+        lines.append(f'    <testcase classname={classname} name={name} time="{(r["elapsed_ms"] or 0) / 1000.0:.3f}">')
+        if r["error"]:
+            lines.append(f'      <error message={quoteattr(r["error"])}/>')
+        failed = [t for t in r["tests"] if not t["passed"]]
+        if failed:
+            text = "\n".join(f"{t['name']}: {t['message']}" for t in failed)
+            lines.append(f'      <failure message={quoteattr(f"{len(failed)} assertion(s) failed")}>{escape(text)}</failure>')
+        lines.append('    </testcase>')
+    lines += ['  </testsuite>', '</testsuites>', '']
+    return "\n".join(lines)
+
+
+class CollectionRunWorker(QThread):
+    """Runs a CollectionRunner off the UI thread, reporting through signals."""
+
+    result = pyqtSignal(dict)
+    variables = pyqtSignal(dict)
+
+    def __init__(self, requests_list, env, **options):
+        super().__init__()
+        self.runner = CollectionRunner(
+            requests_list, env,
+            on_result=self.result.emit, on_variables=self.variables.emit, **options,
+        )
+
+    def stop(self):
+        self.runner.stop()
+
+    def run(self):
+        self.runner.run()
 
 
 class CollectionRunnerDialog(QDialog):
@@ -6846,11 +6927,8 @@ class CollectionRunnerDialog(QDialog):
 
     @staticmethod
     def _row_outcome(row):
-        if row["error"]:
-            return "ERROR", QColor("#d9534f")
-        if any(not t["passed"] for t in row["tests"]):
-            return "FAIL", QColor("#dc3545")
-        return "PASS", QColor("#28a745")
+        outcome = run_outcome(row)
+        return outcome, QColor({"ERROR": "#d9534f", "FAIL": "#dc3545"}.get(outcome, "#28a745"))
 
     def _on_result(self, row):
         self.results.append(row)
@@ -6937,45 +7015,13 @@ class CollectionRunnerDialog(QDialog):
             return
         try:
             if fname.lower().endswith(".xml") or "JUnit" in chosen:
-                Path(fname).write_text(self._junit_xml(), encoding="utf-8")
+                Path(fname).write_text(results_to_junit(self.collection_name, self.results), encoding="utf-8")
             else:
-                report = {
-                    "collection": self.collection_name,
-                    "environment": self.env_name,
-                    "finished_at": _dt.datetime.now().isoformat(timespec="seconds"),
-                    "results": [{k: v for k, v in r.items() if k != "response_body"} for r in self.results],
-                }
+                report = results_to_report(self.collection_name, self.env_name, self.results)
                 Path(fname).write_text(json.dumps(report, indent=2), encoding="utf-8")
             self.main.status_bar.showMessage(f"Run results exported to {fname}")
         except Exception as e:
             QMessageBox.critical(self, "Export Error", str(e))
-
-    def _junit_xml(self):
-        from xml.sax.saxutils import escape, quoteattr
-        failures = sum(1 for r in self.results if not r["error"] and any(not t["passed"] for t in r["tests"]))
-        errors = sum(1 for r in self.results if r["error"])
-        total_time = sum((r["elapsed_ms"] or 0) for r in self.results) / 1000.0
-        suite = quoteattr(self.collection_name)
-        lines = [
-            '<?xml version="1.0" encoding="UTF-8"?>',
-            f'<testsuites name={suite} tests="{len(self.results)}" failures="{failures}" '
-            f'errors="{errors}" time="{total_time:.3f}">',
-            f'  <testsuite name={suite} tests="{len(self.results)}" failures="{failures}" '
-            f'errors="{errors}" time="{total_time:.3f}">',
-        ]
-        for r in self.results:
-            name = quoteattr(f"{r['method']} {r['name']}")
-            classname = quoteattr(f"{self.collection_name}.iteration{r['iteration']}")
-            lines.append(f'    <testcase classname={classname} name={name} time="{(r["elapsed_ms"] or 0) / 1000.0:.3f}">')
-            if r["error"]:
-                lines.append(f'      <error message={quoteattr(r["error"])}/>')
-            failed = [t for t in r["tests"] if not t["passed"]]
-            if failed:
-                text = "\n".join(f"{t['name']}: {t['message']}" for t in failed)
-                lines.append(f'      <failure message={quoteattr(f"{len(failed)} assertion(s) failed")}>{escape(text)}</failure>')
-            lines.append('    </testcase>')
-        lines += ['  </testsuite>', '</testsuites>', '']
-        return "\n".join(lines)
 
     def closeEvent(self, event):
         if self.worker is not None and self.worker.isRunning():
@@ -8150,7 +8196,233 @@ class CurlPyProMainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+# ---------------------------
+# Command-line runner (for CI)
+# ---------------------------
+class CliError(Exception):
+    """A usage/configuration problem: reported and exits with code 2."""
+
+
+def _cli_env_from_file(path, env_name):
+    data = parse_import_text(Path(path).read_text(encoding="utf-8-sig"))
+    if detect_import_format(data) == "postman-environment":
+        return import_postman_environment(data)["environments"].popitem()[1]
+    if isinstance(data, dict) and data and all(isinstance(v, dict) for v in data.values()):
+        # A {name: {vars}} map, like CurlPyPro's own environments.
+        if env_name and env_name in data:
+            return data[env_name]
+        if len(data) == 1:
+            return next(iter(data.values()))
+        raise CliError(f"{path} holds several environments ({', '.join(data)}); choose one with --env")
+    if isinstance(data, dict):
+        return {str(k): "" if v is None else str(v) for k, v in data.items()}
+    raise CliError(f"{path} is not an environment file")
+
+
+def _cli_load(args):
+    """Return (collection_name, requests, env_name, env)."""
+    file_envs = {}
+    if args.file:
+        try:
+            data = parse_import_text(Path(args.file).read_text(encoding="utf-8-sig"))
+            result = import_any(data)
+        except OSError as e:
+            raise CliError(f"Can't read {args.file}: {e}")
+        except ValueError as e:
+            raise CliError(str(e))
+        collections = {
+            (name or Path(args.file).stem): items
+            for name, items in result["collections"].items() if isinstance(items, list)
+        }
+        file_envs = result["environments"]
+    else:
+        init_db()
+        collections = load_document("collections", {})
+
+    if not collections:
+        raise CliError("No collections found" + (f" in {args.file}" if args.file else " in ~/.curlpypro"))
+    if args.collection:
+        if args.collection not in collections:
+            raise CliError(f"Collection '{args.collection}' not found. Available: {', '.join(collections)}")
+        name = args.collection
+    elif len(collections) == 1:
+        name = next(iter(collections))
+    else:
+        raise CliError(f"Several collections found; name one of: {', '.join(collections)}")
+
+    env = dict(file_envs.get(name, {}))  # e.g. Postman collection variables, OpenAPI baseUrl
+    env_name = args.env or (name if name in file_envs else "")
+    if args.env and not args.env_file:
+        if args.env in file_envs:
+            env.update(file_envs[args.env])
+        else:
+            init_db()
+            saved_envs, _secrets = load_envs()
+            if args.env not in saved_envs:
+                raise CliError(f"Environment '{args.env}' not found. Available: {', '.join(saved_envs)}")
+            env.update(saved_envs[args.env])
+    if args.env_file:
+        env.update(_cli_env_from_file(args.env_file, args.env))
+    for item in args.var or []:
+        key, sep, value = item.partition("=")
+        if not sep or not key.strip():
+            raise CliError(f"--var expects KEY=VALUE, got '{item}'")
+        env[key.strip()] = value
+
+    requests_list = copy.deepcopy(collections[name])
+    if args.insecure:
+        for req in requests_list:
+            req.setdefault("advanced", {})["verify_ssl"] = False
+    return name, requests_list, env_name, env
+
+
+def cli_run(args, out=None):
+    out = out or sys.stdout
+    name, requests_list, env_name, env = _cli_load(args)
+    if not requests_list:
+        raise CliError(f"Collection '{name}' has no requests")
+
+    utf = (getattr(out, "encoding", "") or "").lower().replace("-", "").startswith("utf")
+    tick, cross, warn = ("\u2713", "\u2717", "!") if utf else ("+", "x", "!")
+    use_color = getattr(out, "isatty", lambda: False)() and not os.environ.get("NO_COLOR")
+
+    def color(text, code):
+        return f"\033[{code}m{text}\033[0m" if use_color else text
+
+    outcome_colors = {"PASS": "32", "FAIL": "31", "ERROR": "31;1"}
+    iterations = f"{args.iterations} iterations" if args.iterations > 1 else "1 iteration"
+    env_label = f' with environment "{env_name}"' if env_name else ""
+    print(f'CurlPyPro {__version__}: running "{name}" ({len(requests_list)} requests, {iterations}){env_label}\n', file=out)
+
+    def on_result(row):
+        outcome = run_outcome(row)
+        prefix = f"[{row['iteration']}] " if args.iterations > 1 else ""
+        if row["error"]:
+            detail = row["error"]
+        else:
+            detail = f"{row['status']}  {row['elapsed_ms']} ms"
+        print(f"  {color(outcome.ljust(5), outcome_colors[outcome])} {prefix}{row['method']:<7} {row['name']}  {detail}", file=out)
+        for t in row["tests"]:
+            if t["passed"] and not args.verbose:
+                continue
+            mark = color(tick, "32") if t["passed"] else color(cross, "31")
+            msg = f"  ({t['message']})" if t["message"] else ""
+            print(f"          {mark} {t['name']}{msg}", file=out)
+        for note in row["notes"]:
+            print(f"          {color(warn, '33')} {note}", file=out)
+        out.flush()
+
+    started = time.time()
+    runner = CollectionRunner(
+        requests_list, env,
+        iterations=args.iterations, delay_ms=args.delay, stop_on_failure=args.bail,
+        timeout=args.timeout or None, cookie_jar=requests.cookies.RequestsCookieJar(),
+        run_scripts=not args.no_scripts, on_result=on_result,
+    )
+    results = runner.run()
+    elapsed = time.time() - started
+
+    report = results_to_report(name, env_name, results)
+    summary = report["summary"]
+    ok = summary["failed"] == 0 and summary["errors"] == 0
+    print(
+        f"\nRequests: {summary['requests']} ({summary['failed']} failed, {summary['errors']} errors)  "
+        f"Tests: {summary['tests_passed']}/{summary['tests']} passed  Time: {elapsed:.1f} s  "
+        + color("PASSED" if ok else "FAILED", "32;1" if ok else "31;1"),
+        file=out,
+    )
+    if args.junit:
+        Path(args.junit).write_text(results_to_junit(name, results), encoding="utf-8")
+        print(f"JUnit report: {args.junit}", file=out)
+    if args.json:
+        Path(args.json).write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print(f"JSON report: {args.json}", file=out)
+    return 0 if ok else 1
+
+
+def build_cli_parser():
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="curlpypro",
+        description="CurlPyPro desktop API client. Run with no arguments to open the app.",
+    )
+    parser.add_argument("--version", action="version", version=f"CurlPyPro {__version__}")
+    sub = parser.add_subparsers(dest="command")
+    run = sub.add_parser(
+        "run",
+        help="run a collection's requests and assertions from the command line",
+        description="Run a collection and exit with 0 if every request and assertion passed, "
+                    "1 if any failed, or 2 on a usage error.",
+        epilog="examples:\n"
+               "  curlpypro run \"My API\" --env staging\n"
+               "  curlpypro run --file shop.postman_collection.json --var baseUrl=http://localhost:8080\n"
+               "  curlpypro run --file api.json --env-file ci.env.json --junit results.xml",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    run.add_argument("collection", nargs="?",
+                     help="collection name (optional when there is only one)")
+    run.add_argument("-f", "--file",
+                     help="collection file to run: a CurlPyPro export, Postman collection or OpenAPI spec. "
+                          "Without it, collections saved in ~/.curlpypro are used")
+    run.add_argument("-e", "--env", help="environment name (saved in ~/.curlpypro, or a key in --env-file)")
+    run.add_argument("--env-file", help="environment file: Postman environment, {\"KEY\": \"value\"}, or a CurlPyPro envs export")
+    run.add_argument("--var", action="append", metavar="KEY=VALUE",
+                     help="set a variable (repeatable; overrides the environment)")
+    run.add_argument("-n", "--iterations", type=int, default=1, help="times to run the collection (default 1)")
+    run.add_argument("--delay", type=int, default=0, metavar="MS", help="pause between requests in milliseconds")
+    run.add_argument("--timeout", type=float, default=30, metavar="SECONDS",
+                     help="per-request timeout; 0 waits forever (default 30)")
+    run.add_argument("--bail", action="store_true", help="stop at the first failed request")
+    run.add_argument("-k", "--insecure", action="store_true", help="skip TLS certificate verification")
+    run.add_argument("--no-scripts", action="store_true", help="don't run post-response scripts")
+    run.add_argument("--junit", metavar="PATH", help="write a JUnit XML report")
+    run.add_argument("--json", metavar="PATH", help="write a JSON report")
+    run.add_argument("-v", "--verbose", action="store_true", help="also list passing assertions")
+    return parser
+
+
+def _attach_console():
+    """The packaged Windows app has no console; borrow the parent's for CLI output."""
+    if sys.stdout is not None:
+        return
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            if ctypes.windll.kernel32.AttachConsole(-1):
+                sys.stdout = sys.stderr = open("CONOUT$", "w", encoding="utf-8", errors="replace")
+                return
+        except Exception:
+            pass
+    sys.stdout = sys.stderr = open(os.devnull, "w")
+
+
+def cli_main(argv):
+    _attach_console()
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except Exception:
+        pass
+    parser = build_cli_parser()
+    args = parser.parse_args(argv)
+    if args.command != "run":
+        parser.print_help()
+        return 2
+    if args.iterations < 1:
+        parser.error("--iterations must be at least 1")
+    try:
+        return cli_run(args)
+    except CliError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("run", "--version", "-h", "--help"):
+        sys.exit(cli_main(sys.argv[1:]))
+
     if sys.platform == "win32":
         # Gives the taskbar/window a stable identity instead of Python's icon.
         try:

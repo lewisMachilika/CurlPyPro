@@ -76,6 +76,8 @@ keeps everything in one local SQLite file you control.
   JSON paths (`$.data.items[0].id`, `$.items.length`), with quick-add presets
 - **Collection runner:** run a whole collection in order with iterations,
   delays and stop-on-failure; export results as JSON or **JUnit XML** for CI
+- **Command-line runner** (`curlpypro run`) for CI pipelines, with exit codes
+  and JUnit/JSON reports
 - Post-response Python scripts that can read the response and update variables
 
 ### Import
@@ -127,6 +129,67 @@ python -m venv .venv
 pip install -r requirements.txt
 python curlpypro.py
 ```
+
+## Run collections from the command line
+
+`curlpypro run` runs a collection's requests, captures and assertions without
+opening the window. It exits with **0** when everything passed, **1** when a
+request or assertion failed, and **2** on a usage error, so it works as a CI step.
+
+```bash
+# A collection saved in the app, with a saved environment
+python curlpypro.py run "My API" --env staging
+
+# A file: CurlPyPro export, Postman collection or OpenAPI spec (JSON/YAML)
+python curlpypro.py run --file shop.postman_collection.json --var baseUrl=http://localhost:8080
+
+# CI: environment from a file, secrets from variables, reports for the CI UI
+python curlpypro.py run --file api-tests.json --env-file ci.env.json \
+    --var TOKEN="$API_TOKEN" --junit results.xml --json results.json
+```
+
+Sample output:
+
+```text
+CurlPyPro 1.0.0: running "Chain" (2 requests, 1 iteration)
+
+  PASS  POST    Login  200  3 ms
+  FAIL  GET     Me  200  2 ms
+          ✗ JSON path $.user equals bob  (actual: ann)
+
+Requests: 2 (1 failed, 0 errors)  Tests: 2/3 passed  Time: 0.1 s  FAILED
+```
+
+Useful options: `-n/--iterations`, `--delay MS`, `--timeout SECONDS`, `--bail`
+(stop at the first failure), `-k/--insecure`, `--no-scripts`, `-v/--verbose`.
+Run `python curlpypro.py run --help` for the full list.
+
+Variables are applied in this order, later ones winning: variables stored in
+the collection file (Postman collection variables, OpenAPI `baseUrl`), then
+`--env`, then `--env-file`, then each `--var`. Captured values are passed
+between requests during the run but are not saved back.
+
+### In GitHub Actions
+
+Export a collection from the app (**Export** under Collections) into your repo,
+then:
+
+```yaml
+- uses: actions/setup-python@v5
+  with:
+    python-version: "3.12"
+- name: Install CurlPyPro
+  run: |
+    sudo apt-get update && sudo apt-get install -y libgl1 libegl1 libxkbcommon0 libdbus-1-3
+    git clone --depth 1 https://github.com/lewisMachilika/CurlPyPro.git /tmp/curlpypro
+    pip install -r /tmp/curlpypro/requirements.txt
+- name: API tests
+  run: python /tmp/curlpypro/curlpypro.py run --file tests/api.json --var baseUrl=http://localhost:8080 --junit api-results.xml
+```
+
+> Use the Python source in CI. The packaged Windows `.exe` is a windowed app:
+> it can print to a console you launch it from, but shells don't wait for it or
+> report its exit code.
 
 ## Keyboard shortcuts
 
@@ -191,7 +254,7 @@ Ideas being considered. Upvote or discuss them in
 - [x] Response diff between two runs
 - [x] Chain requests by capturing response values into variables
 - [x] Secrets in the OS keychain
-- [ ] Command-line runner for CI pipelines
+- [x] Command-line runner for CI pipelines
 - [ ] Export collections back to Postman format
 - [ ] Automated test suite and linting in CI
 
