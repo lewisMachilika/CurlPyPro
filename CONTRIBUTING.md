@@ -35,6 +35,8 @@ clean slate, rename that folder temporarily rather than deleting your history.
   `QThread` worker. Never block the UI thread.
 - Don't break stored data: if you change what goes into the SQLite database,
   add a migration path for existing users.
+- Run `python -m pytest` and `ruff check curlpypro.py tests`; add tests for
+  new behaviour (GUI tests use `pytest-qt` and the local server in `tests/server.py`).
 - Test the flows you touched by hand on at least one OS, and say which in the PR.
 - Update `README.md` and add a line under **Unreleased** in `CHANGELOG.md` for
   user-visible changes.

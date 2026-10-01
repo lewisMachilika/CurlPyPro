@@ -1,0 +1,5 @@
+line-length = 130
+
+[lint]
+# Errors and likely bugs (pyflakes). Style rules are left to review for now.
+select = ["E9", "F"]

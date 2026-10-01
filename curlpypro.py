@@ -9,7 +9,7 @@ Run:
     pip install -r requirements.txt
     python curlpypro.py
 """
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import sys
 import os
@@ -523,7 +523,39 @@ def save_envs(envs, secrets):
     return failed
 
 
-placeholder_pattern = re.compile(r"\{\{([A-Za-z0-9_]+)\}\}")
+# Names may contain dots and dashes ({{api.key}}, {{base-url}}) like Postman's;
+# a leading $ marks a dynamic variable such as {{$guid}}.
+placeholder_pattern = re.compile(r"\{\{\s*(\$?[A-Za-z0-9_][A-Za-z0-9_.\-]*)\s*\}\}")
+
+
+def _dynamic_variable(name):
+    """Value for a built-in {{$name}} variable, or None if it isn't one."""
+    import random
+    import uuid
+    now = _dt.datetime.now(_dt.timezone.utc)
+    if name in ("$guid", "$randomUUID", "$uuid"):
+        return str(uuid.uuid4())
+    if name == "$timestamp":
+        return str(int(now.timestamp()))
+    if name == "$timestampMs":
+        return str(int(now.timestamp() * 1000))
+    if name == "$isoTimestamp":
+        return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+    if name == "$randomInt":
+        return str(random.randint(0, 1000))
+    if name == "$randomAlphaNumeric":
+        return random.choice("abcdefghijklmnopqrstuvwxyz0123456789")
+    if name == "$randomBoolean":
+        return random.choice(("true", "false"))
+    if name == "$randomEmail":
+        return f"user{random.randint(1000, 99999)}@example.com"
+    return None
+
+
+DYNAMIC_VARIABLES = [
+    "$guid", "$randomUUID", "$timestamp", "$timestampMs", "$isoTimestamp",
+    "$randomInt", "$randomAlphaNumeric", "$randomBoolean", "$randomEmail",
+]
 
 
 def apply_env(text: str, env: dict):
@@ -532,9 +564,27 @@ def apply_env(text: str, env: dict):
 
     def repl(m):
         key = m.group(1)
-        return str(env.get(key, m.group(0)))
+        if key in env:
+            return str(env[key])
+        if key.startswith("$"):
+            value = _dynamic_variable(key)
+            if value is not None:
+                return value
+        return m.group(0)
 
     return placeholder_pattern.sub(repl, text)
+
+
+def find_unresolved(text, env):
+    """Names of {{VARS}} in `text` that neither `env` nor a dynamic variable can fill."""
+    missing = []
+    for m in placeholder_pattern.finditer(text or ""):
+        key = m.group(1)
+        if key in env or (key.startswith("$") and _dynamic_variable(key) is not None):
+            continue
+        if key not in missing:
+            missing.append(key)
+    return missing
 
 
 def parse_status_code_list(text: str):
@@ -1205,6 +1255,17 @@ def prepare_request(req, env, timeout=30, oauth_token=None):
             except Exception as e:
                 close_call_files(files)
                 raise RequestBuildError("File Error", f"Failed to open attachment: {e}", critical=True)
+    elif body_type == "Binary":
+        path = apply_env((req.get("binary_file") or "").strip(), env)
+        if path:
+            try:
+                data = Path(os.path.expanduser(path)).read_bytes()
+            except OSError as e:
+                raise RequestBuildError("File Error", f"Can't read the binary body file: {e}", critical=True)
+            if not any(k.lower() == "content-type" for k in headers):
+                headers["Content-Type"] = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        elif body_raw:
+            data = body_raw.encode("utf-8")
     else:
         data = body_raw.encode("utf-8") if body_raw else None
 
@@ -1562,8 +1623,31 @@ def _empty_request(name, method="GET", url=""):
         "name": name, "method": method, "url": url, "headers": "", "params": [],
         "body_type": "Raw", "body": "", "auth": {"type": "No Auth"}, "advanced": {},
         "attachments": [], "output_file": None, "scripts": {}, "tests": [], "captures": [],
-        "graphql_variables": "",
+        "graphql_variables": "", "binary_file": "",
     }
+
+
+def new_request_id():
+    import uuid
+    return uuid.uuid4().hex
+
+
+def ensure_request_id(req):
+    """Give a saved request a stable id (older saves have none) and return it."""
+    if not req.get("id"):
+        req["id"] = new_request_id()
+    return req["id"]
+
+
+def find_request_by_id(collections, req_id):
+    """(collection, index) of the request with `req_id`, or None."""
+    if not req_id:
+        return None
+    for name, items in (collections or {}).items():
+        for i, req in enumerate(items or []):
+            if isinstance(req, dict) and req.get("id") == req_id:
+                return name, i
+    return None
 
 
 def _postman_kv(entries):
@@ -1643,17 +1727,31 @@ def _postman_url(url):
     return base, rows
 
 
+_POSTMAN_TEST_PATTERNS = [
+    (r"pm\.response\.to\.have\.status\(\s*(\d{3})\s*\)",
+     lambda m: ("Status code", "", "equals", m.group(1))),
+    (r"pm\.expect\(\s*pm\.response\.responseTime\s*\)\.to\.be\.below\(\s*(\d+)\s*\)",
+     lambda m: ("Response time (ms)", "", "<", m.group(1))),
+    (r"pm\.response\.to\.have\.header\(\s*(['\"])(.+?)\1\s*\)",
+     lambda m: ("Header", m.group(2), "exists", "")),
+    (r"pm\.expect\(\s*pm\.response\.text\(\)\s*\)\.to\.include\(\s*(['\"])(.*?)\1\s*\)",
+     lambda m: ("Body", "", "contains", m.group(2))),
+]
+
+
 def _postman_tests(events):
-    """Translate the simplest Postman test, pm.response.to.have.status(N), into an assertion."""
+    """Translate the common Postman checks (status, response time, header, body text) into assertions."""
     tests = []
     for ev in events or []:
         if not isinstance(ev, dict) or ev.get("listen") != "test":
             continue
         exec_lines = (ev.get("script") or {}).get("exec") or []
         code = "\n".join(exec_lines) if isinstance(exec_lines, list) else str(exec_lines)
-        for m in re.finditer(r"pm\.response\.to\.have\.status\(\s*(\d{3})\s*\)", code):
-            tests.append({"enabled": True, "source": "Status code", "property": "",
-                          "operator": "equals", "expected": m.group(1)})
+        for pattern, build in _POSTMAN_TEST_PATTERNS:
+            for m in re.finditer(pattern, code):
+                source, prop, op, expected = build(m)
+                tests.append({"enabled": True, "source": source, "property": prop,
+                              "operator": op, "expected": expected})
     return tests
 
 
@@ -1705,6 +1803,9 @@ def _postman_request(item, name, inherited_auth, warnings):
         req["body_type"] = "GraphQL"
         req["body"] = gql.get("query") or ""
         req["graphql_variables"] = gql.get("variables") or ""
+    elif mode == "file":
+        req["body_type"] = "Binary"
+        req["binary_file"] = str((body.get("file") or {}).get("src") or "")
     elif mode:
         warnings.append(f"{name}: body mode '{mode}' is not supported and was skipped")
 
@@ -1746,8 +1847,146 @@ def import_postman_collection(data):
     if variables:
         envs[coll_name] = variables
     if any("pm." in json.dumps(i.get("event") or []) for i in data.get("item") or [] if isinstance(i, dict)):
-        warnings.append("Postman JavaScript tests/scripts can't run here; only status-code checks were converted.")
+        warnings.append("Postman JavaScript can't run here; status, response-time, header and body-text "
+                        "checks were converted to assertions.")
     return {"collections": {coll_name: requests_out}, "environments": envs, "warnings": warnings}
+
+
+_POSTMAN_SCHEMA = "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+
+
+def _postman_test_script(tests):
+    """Postman `pm.*` test lines for the assertions that have a direct equivalent."""
+    lines, skipped = [], 0
+    for t in tests or []:
+        if not t.get("enabled", True):
+            continue
+        source, op = t.get("source"), t.get("operator")
+        prop, expected = t.get("property") or "", str(t.get("expected") or "")
+        if source == "Status code" and op == "equals" and expected.isdigit():
+            lines.append(f'pm.test("Status code is {expected}", () => pm.response.to.have.status({expected}));')
+        elif source == "Response time (ms)" and op == "<" and expected.isdigit():
+            lines.append(f'pm.test("Response time below {expected} ms", () => '
+                         f'pm.expect(pm.response.responseTime).to.be.below({expected}));')
+        elif source == "Header" and op == "exists" and prop:
+            lines.append(f"pm.test({json.dumps('Has header ' + prop)}, () => "
+                         f"pm.response.to.have.header({json.dumps(prop)}));")
+        elif source == "Body" and op == "contains":
+            lines.append(f"pm.test({json.dumps('Body contains ' + expected)}, () => "
+                         f"pm.expect(pm.response.text()).to.include({json.dumps(expected)}));")
+        else:
+            skipped += 1
+    return lines, skipped
+
+
+def _postman_auth_out(auth):
+    auth = auth or {}
+    t = auth.get("type")
+
+    def kv(**values):
+        return [{"key": k, "value": v, "type": "string"} for k, v in values.items()]
+
+    if t == "Bearer Token":
+        return {"type": "bearer", "bearer": kv(token=auth.get("token", ""))}
+    if t == "Basic Auth":
+        return {"type": "basic", "basic": kv(username=auth.get("username", ""), password=auth.get("password", ""))}
+    if t == "API Key":
+        return {"type": "apikey", "apikey": kv(key=auth.get("key", ""), value=auth.get("value", ""),
+                                               **{"in": "query" if auth.get("add_to") == "Query Params" else "header"})}
+    if t == "OAuth 2.0":
+        grant = {"Client Credentials": "client_credentials", "Password Credentials": "password_credentials",
+                 "Authorization Code": "authorization_code"}.get(auth.get("grant_type"), "client_credentials")
+        return {"type": "oauth2", "oauth2": kv(
+            grant_type=grant, accessTokenUrl=auth.get("token_url", ""), authUrl=auth.get("auth_url", ""),
+            clientId=auth.get("client_id", ""), clientSecret=auth.get("client_secret", ""),
+            scope=auth.get("scope", ""), redirect_uri=auth.get("redirect_uri", ""),
+            username=auth.get("username", ""), password=auth.get("password", ""))}
+    return {"type": "noauth"}
+
+
+def _postman_request_out(req, warnings):
+    name = req.get("name") or "Request"
+    url = req.get("url") or ""
+    base, _sep, raw_query = url.partition("?")
+    query = [{"key": k, "value": v} for k, v in parse_qsl(raw_query, keep_blank_values=True)]
+    for row in req.get("params") or []:
+        if isinstance(row, dict) and row.get("key"):
+            entry = {"key": str(row["key"]), "value": str(row.get("value") or "")}
+            if not row.get("enabled", True):
+                entry["disabled"] = True
+            query.append(entry)
+    enabled = [(q["key"], q["value"]) for q in query if not q.get("disabled")]
+    raw = base + ("?" + "&".join(f"{k}={v}" for k, v in enabled) if enabled else "")
+    out = {
+        "method": (req.get("method") or "GET").upper(),
+        "header": [
+            {"key": k.strip(), "value": v.strip()}
+            for k, _s, v in (line.partition(":") for line in (req.get("headers") or "").splitlines())
+            if _s and k.strip()
+        ],
+        "url": {"raw": raw, "query": query} if query else {"raw": raw},
+        "auth": _postman_auth_out(req.get("auth")),
+    }
+
+    body_type, body = req.get("body_type") or "Raw", req.get("body") or ""
+    if body_type == "GraphQL":
+        out["body"] = {"mode": "graphql", "graphql": {"query": body, "variables": req.get("graphql_variables") or ""}}
+    elif body_type == "Binary" and req.get("binary_file"):
+        out["body"] = {"mode": "file", "file": {"src": req["binary_file"]}}
+    elif body_type == "Form Data":
+        fields = [p.split("=", 1) for p in body.split("&") if "=" in p]
+        if req.get("attachments"):
+            out["body"] = {"mode": "formdata", "formdata": [
+                {"key": k, "value": v, "type": "text"} for k, v in fields
+            ] + [
+                {"key": a.get("field") or "file", "type": "file", "src": a.get("path") or ""}
+                for a in req["attachments"]
+            ]}
+        else:
+            out["body"] = {"mode": "urlencoded", "urlencoded": [{"key": k, "value": v} for k, v in fields]}
+    elif body:
+        out["body"] = {"mode": "raw", "raw": body}
+        if body_type == "JSON" or body.lstrip().startswith(("{", "[")):
+            out["body"]["options"] = {"raw": {"language": "json"}}
+
+    item = {"name": name.rsplit(" / ", 1)[-1], "request": out}
+    lines, skipped = _postman_test_script(req.get("tests"))
+    if lines:
+        item["event"] = [{"listen": "test", "script": {"type": "text/javascript", "exec": lines}}]
+    if skipped:
+        warnings.append(f"{name}: {skipped} assertion(s) have no Postman equivalent and were left out")
+    if (req.get("captures") or []) or ((req.get("scripts") or {}).get("enabled")):
+        warnings.append(f"{name}: captures and Python scripts are not exported")
+    return item
+
+
+def export_postman_collection(name, requests_list, variables=None):
+    """Convert a CurlPyPro collection to Postman v2.1. Returns (collection_dict, warnings).
+
+    Request names written as "Folder / Request" (the way Postman imports are named)
+    become Postman folders again.
+    """
+    import uuid
+    warnings = []
+    root = {"item": []}
+    folders = {}
+    for req in requests_list or []:
+        parts = (req.get("name") or "Request").split(" / ")
+        parent = root
+        for depth in range(1, len(parts)):
+            key = tuple(parts[:depth])
+            if key not in folders:
+                folders[key] = {"name": parts[depth - 1], "item": []}
+                parent["item"].append(folders[key])
+            parent = folders[key]
+        parent["item"].append(_postman_request_out(req, warnings))
+    collection = {
+        "info": {"_postman_id": str(uuid.uuid4()), "name": name, "schema": _POSTMAN_SCHEMA},
+        "item": root["item"],
+    }
+    if variables:
+        collection["variable"] = [{"key": k, "value": str(v)} for k, v in variables.items()]
+    return collection, warnings
 
 
 def import_postman_environment(data):
@@ -3367,19 +3606,24 @@ class MultiSnippetDialog(QDialog):
         if not fname:
             return
         try:
-            Path(fname).write_text(editor.toPlainText())
+            Path(fname).write_text(editor.toPlainText(), encoding="utf-8")
             QMessageBox.information(self, "Saved", f"Saved {name} snippet to {fname}")
         except Exception as e:
             QMessageBox.critical(self, "Save Error", str(e))
 
 
 class SaveToCollectionDialog(QDialog):
-    """Pick an existing collection or type a new name."""
-    def __init__(self, existing_collections: list, parent=None):
+    """Name the request, then pick an existing collection or type a new name."""
+    def __init__(self, existing_collections: list, parent=None, request_name=""):
         super().__init__(parent)
         self.setWindowTitle("Save to Collection")
         self.setMinimumWidth(340)
         layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("Request name:"))
+        self.request_name_edit = QLineEdit(request_name)
+        self.request_name_edit.setPlaceholderText("e.g. Get user by id")
+        layout.addWidget(self.request_name_edit)
 
         if existing_collections:
             layout.addWidget(QLabel("Select an existing collection:"))
@@ -3409,6 +3653,9 @@ class SaveToCollectionDialog(QDialog):
 
     def collection_name(self) -> str:
         return self.name_edit.text().strip()
+
+    def request_name(self) -> str:
+        return self.request_name_edit.text().strip()
 
 
 class SnippetDialog(QDialog):
@@ -3445,7 +3692,7 @@ class SnippetDialog(QDialog):
         if not fname:
             return
         try:
-            Path(fname).write_text(self.snippet_editor.toPlainText())
+            Path(fname).write_text(self.snippet_editor.toPlainText(), encoding="utf-8")
             QMessageBox.information(self, "Saved", f"Saved snippet to {fname}")
         except Exception as e:
             QMessageBox.critical(self, "Save Error", str(e))
@@ -3548,6 +3795,8 @@ class RequestPanel(QWidget):
 
         self._oauth_access_token = None
         self._oauth_token_expires_at = 0
+        self._origin_id = None   # id of the collection request this tab edits, if any
+        self._request_name = ""  # its display name
 
         self.init_ui()
 
@@ -3608,10 +3857,12 @@ class RequestPanel(QWidget):
         timeout_action.setDefaultWidget(timeout_widget)
 
         actions_menu = QMenu()
-        actions_menu.addAction("Save to Collection", self.save_to_collection)
-        actions_menu.addAction("Save as File", self.save_request_file)
-        actions_menu.addAction("Load", self.load_request_file)
+        actions_menu.addAction("Save  (Ctrl+S)", self.save)
+        actions_menu.addAction("Save to Collection…  (Ctrl+Shift+S)", self.save_to_collection)
+        actions_menu.addAction("Save as File…", self.save_request_file)
+        actions_menu.addAction("Load from File…", self.load_request_file)
         actions_menu.addSeparator()
+        actions_menu.addAction("Copy as cURL  (Ctrl+Shift+C)", self.copy_as_curl)
         actions_menu.addAction("Generate - All Languages...", self.generate_all_and_show)
         actions_menu.addAction("Generate - curl", lambda: self.generate_code_and_show("curl"))
         actions_menu.addAction("Generate - python-requests", lambda: self.generate_code_and_show("python-requests"))
@@ -3694,6 +3945,17 @@ class RequestPanel(QWidget):
         self.attachments_group.setVisible(False)
         body_layout.addWidget(self.attachments_group)
 
+        self.binary_group = QGroupBox("Binary body")
+        binary_layout = QHBoxLayout(self.binary_group)
+        self.binary_file_input = QLineEdit()
+        self.binary_file_input.setPlaceholderText("File whose raw bytes are sent as the body ({{VARS}} allowed)")
+        binary_choose_btn = QPushButton("Choose File…")
+        binary_choose_btn.clicked.connect(self._choose_binary_file)
+        binary_layout.addWidget(self.binary_file_input, 1)
+        binary_layout.addWidget(binary_choose_btn)
+        self.binary_group.setVisible(False)
+        body_layout.addWidget(self.binary_group)
+
         self.graphql_group = QGroupBox("GraphQL variables (JSON)")
         graphql_layout = QVBoxLayout(self.graphql_group)
         self.graphql_variables_text = QPlainTextEdit()
@@ -3749,9 +4011,28 @@ class RequestPanel(QWidget):
         response_group.setMinimumHeight(220)
         response_layout = QVBoxLayout(response_group)
 
+        summary_row = QHBoxLayout()
         self.response_summary = QLabel("Ready to send request...")
         self.response_summary.setWordWrap(True)
-        response_layout.addWidget(self.response_summary)
+        self.response_summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        summary_row.addWidget(self.response_summary, 1)
+        self.response_filter = QLineEdit()
+        self.response_filter.setPlaceholderText("Filter: text, or $.json.path   (Ctrl+F)")
+        self.response_filter.setToolTip(
+            "Type text to show only matching lines of the Pretty view, or a JSON path such as "
+            "$.data.items[0] or $.items.length to show just that part of a JSON response."
+        )
+        self.response_filter.setClearButtonEnabled(True)
+        self.response_filter.setMaximumWidth(320)
+        self.response_filter.textChanged.connect(self._apply_response_filter)
+        summary_row.addWidget(self.response_filter)
+        copy_body_btn = QToolButton()
+        copy_body_btn.setText("Copy")
+        copy_body_btn.setToolTip("Copy the response body (as shown in Pretty) to the clipboard")
+        copy_body_btn.clicked.connect(self.copy_response_body)
+        summary_row.addWidget(copy_body_btn)
+        response_layout.addLayout(summary_row)
+        self._pretty_full_text = ""
 
         self.response_tabs = QTabWidget()
         self.response_tabs.setSizePolicy(
@@ -3819,20 +4100,12 @@ class RequestPanel(QWidget):
         self.response_preview_scroll.setWidget(self.response_preview_label)
         self.response_preview_scroll.setWidgetResizable(True)
 
-        if QWebEngineView is not None:
-            self.response_preview_html = QWebEngineView()
-            settings = self.response_preview_html.settings()
-            settings.setAttribute(
-                QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, False
-            )
-        else:
-            self.response_preview_html = QTextBrowser()
-            self.response_preview_html.setOpenExternalLinks(True)
-            self.response_preview_html.setReadOnly(True)
+        # The HTML preview is created on first use: a web engine view per tab
+        # is slow to build and heavy to keep around for tabs that never need it.
+        self.response_preview_html = None
 
         self.response_preview_stack = QStackedWidget()
         self.response_preview_stack.addWidget(self.response_preview_scroll)
-        self.response_preview_stack.addWidget(self.response_preview_html)
         self.response_tabs.addTab(self.response_preview_stack, "Preview")
 
         response_layout.addWidget(self.response_tabs)
@@ -3841,7 +4114,7 @@ class RequestPanel(QWidget):
         self.btn_save_response_bytes.setToolTip("Save raw response bytes to a file (good for PDFs/images/binary).")
         self.btn_save_response_bytes.clicked.connect(self._save_response_body_bytes)
 
-        self.btn_extract_base64 = QPushButton("Extract & Save Base64...")
+        self.btn_extract_base64 = QPushButton("Extract && Save Base64...")
         self.btn_extract_base64.setToolTip("Parse JSON/Raw for base64 or data: URLs and save the decoded file.")
         self.btn_extract_base64.clicked.connect(self._extract_and_save_base64)
 
@@ -5391,12 +5664,13 @@ class RequestPanel(QWidget):
                 self.response_preview_label.clear()
                 self.response_preview_label.setText("Could not decode image")
         elif is_html:
-            if QWebEngineView is not None:
-                self.response_preview_html.setHtml(raw_text, QUrl(response.url))
+            view = self._html_preview()
+            if QWebEngineView is not None and isinstance(view, QWebEngineView):
+                view.setHtml(raw_text, QUrl(response.url))
             else:
-                self.response_preview_html.document().setBaseUrl(QUrl(response.url))
-                self.response_preview_html.setHtml(raw_text)
-            self.response_preview_stack.setCurrentWidget(self.response_preview_html)
+                view.document().setBaseUrl(QUrl(response.url))
+                view.setHtml(raw_text)
+            self.response_preview_stack.setCurrentWidget(view)
         else:
             self.response_preview_stack.setCurrentWidget(self.response_preview_scroll)
             self.response_preview_label.clear()
@@ -5425,6 +5699,13 @@ class RequestPanel(QWidget):
         else:
             self.response_pretty.setPlainText(raw_text)
 
+        self._pretty_full_text = self.response_pretty.toPlainText()
+        if self.response_filter.text().strip():
+            self._apply_response_filter()
+        color = ("#28a745" if 200 <= status_code < 300 else "#17a2b8" if 300 <= status_code < 400
+                 else "#e0a800" if 400 <= status_code < 500 else "#dc3545")
+        self.response_summary.setStyleSheet(f"QLabel {{ color: {color}; font-weight: bold; }}")
+
         # QTextEdit may preserve the old scroll offsets across setPlainText().
         # Always reveal the beginning of a newly loaded result.
         for editor in (
@@ -5438,6 +5719,89 @@ class RequestPanel(QWidget):
             editor.horizontalScrollBar().setValue(0)
 
         self.response_tabs.setCurrentWidget(self.response_pretty)
+
+    def _html_preview(self):
+        if self.response_preview_html is None:
+            view = None
+            if QWebEngineView is not None:
+                try:
+                    view = QWebEngineView()
+                    view.settings().setAttribute(
+                        QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, False
+                    )
+                except Exception:
+                    view = None
+            if view is None:
+                view = QTextBrowser()
+                view.setOpenExternalLinks(True)
+                view.setReadOnly(True)
+            self.response_preview_html = view
+            self.response_preview_stack.addWidget(view)
+        return self.response_preview_html
+
+    def _apply_response_filter(self, *_args):
+        """Show only matching lines, or the value at a JSON path, in the Pretty view."""
+        query = self.response_filter.text().strip()
+        full = self._pretty_full_text
+        if not query or self._last_response is None:
+            if self.response_pretty.toPlainText() != full:
+                self.response_pretty.setPlainText(full)
+            self.response_filter.setStyleSheet("")
+            return
+        if query.startswith("$"):
+            try:
+                data = self._last_response.json()
+            except Exception:
+                data = None
+            found, value = json_path_get(data, query) if data is not None else (False, None)
+            if found:
+                text = value if isinstance(value, str) else json.dumps(value, indent=2, ensure_ascii=False)
+                self.response_filter.setStyleSheet("")
+            else:
+                text = f"No match for {query}" if data is not None else "The response is not JSON."
+                self.response_filter.setStyleSheet("QLineEdit { color: #dc3545; }")
+            self.response_pretty.setPlainText(text)
+        else:
+            needle = query.lower()
+            lines = [line for line in full.splitlines() if needle in line.lower()]
+            self.response_filter.setStyleSheet("" if lines else "QLineEdit { color: #dc3545; }")
+            self.response_pretty.setPlainText("\n".join(lines) if lines else f"No lines contain '{query}'")
+        self.response_tabs.setCurrentWidget(self.response_pretty)
+
+    def focus_response_filter(self):
+        self.response_filter.setFocus()
+        self.response_filter.selectAll()
+
+    def focus_url(self):
+        self.url_input.setFocus()
+        self.url_input.selectAll()
+
+    def copy_response_body(self):
+        text = self.response_pretty.toPlainText() if self._last_response is not None else ""
+        if not text:
+            self.main.status_bar.showMessage("No response to copy yet")
+            return
+        QApplication.clipboard().setText(text)
+        self.main.status_bar.showMessage("Response copied to clipboard")
+
+    def copy_as_curl(self):
+        if not self.url_input.text().strip():
+            self.main.status_bar.showMessage("Enter a URL first")
+            return
+        QApplication.clipboard().setText(self._build_snippet("curl", self._snippet_context()))
+        self.main.status_bar.showMessage("Copied request as cURL")
+
+    def _unresolved_variables(self, env):
+        req = self._build_request_dict()
+        texts = [req["url"], req["headers"], req["body"], req["graphql_variables"], req["binary_file"]]
+        texts += [f"{r.get('key', '')} {r.get('value', '')}" for r in req["params"] if r.get("enabled", True)]
+        texts += [v for v in (req["auth"] or {}).values() if isinstance(v, str)]
+        missing = []
+        for text in texts:
+            for name in find_unresolved(text, env):
+                if name not in missing:
+                    missing.append(name)
+        return missing
 
     # ---------- Attachments ----------
     def add_attachment_file(self):
@@ -5504,7 +5868,7 @@ class RequestPanel(QWidget):
         elif text == "Form Data":
             self.body_text.setPlaceholderText("key=value&other=one  (for text fields)\nUse Attachments below for files.")
         elif text == "Binary":
-            self.body_text.setPlaceholderText("(Binary payload - use Save/Load to manipulate file)")
+            self.body_text.setPlaceholderText("Choose a file below; its bytes are sent as-is.")
         elif text == "GraphQL":
             self.body_text.setPlaceholderText("query GetUser($id: ID!) {\n  user(id: $id) {\n    id\n    name\n  }\n}")
         else:
@@ -5515,6 +5879,14 @@ class RequestPanel(QWidget):
             self.attachments_group.setVisible(show_attachments)
         if hasattr(self, "graphql_group"):
             self.graphql_group.setVisible(text == "GraphQL")
+        if hasattr(self, "binary_group"):
+            self.binary_group.setVisible(text == "Binary")
+            self.body_text.setVisible(text != "Binary")
+
+    def _choose_binary_file(self):
+        fname, _ = QFileDialog.getOpenFileName(self, "Choose Body File", str(Path.home()), "All Files (*)")
+        if fname:
+            self.binary_file_input.setText(fname)
 
     def _update_method_color(self, *_args):
         colors = {
@@ -5664,6 +6036,7 @@ class RequestPanel(QWidget):
             return
         method = call["method"]
         url = call["url"]
+        missing = self._unresolved_variables(env)
 
         self.main._update_tab_title(self)
 
@@ -5675,6 +6048,7 @@ class RequestPanel(QWidget):
             'body_type': self.body_type_combo.currentText(),
             'request_body': self.body_text.toPlainText(),
             'graphql_variables': self.graphql_variables_text.toPlainText(),
+            'binary_file': self.binary_file_input.text(),
             'auth': self.get_auth_config(),
             'advanced': dict(advanced),
             'attachments': self._attachments_snapshot(),
@@ -5682,6 +6056,7 @@ class RequestPanel(QWidget):
             'scripts': self._scripts_snapshot(),
             'tests': self._tests_snapshot(),
             'captures': self._captures_snapshot(),
+            'missing_vars': missing,
         }
 
         req_id = self._req_counter
@@ -5714,7 +6089,11 @@ class RequestPanel(QWidget):
 
         self._update_active_table()
         self._refresh_progress()
-        self.main.status_bar.showMessage(f"Request #{req_id + 1} sent — {method} {url[:60]}")
+        note = ""
+        if missing:
+            env_name = self.main.env_combo.currentText()
+            note = f"  ⚠ not set in '{env_name}': " + ", ".join("{{" + m + "}}" for m in missing)
+        self.main.status_bar.showMessage(f"Request #{req_id + 1} sent — {method} {url[:60]}{note}")
 
     def on_request_finished(self, result, req_id):
         store = self._request_store.get(req_id, {})
@@ -5780,6 +6159,7 @@ class RequestPanel(QWidget):
                 "output_file": snapshot.get('output_file'),
                 "scripts": snapshot.get('scripts', self._scripts_snapshot()),
                 "graphql_variables": snapshot.get('graphql_variables', ""),
+                "binary_file": snapshot.get('binary_file', ""),
                 "tests": snapshot.get('tests', []),
                 "captures": snapshot.get('captures', []),
             }
@@ -5788,12 +6168,20 @@ class RequestPanel(QWidget):
             pass
 
         status_code = response.status_code
+        missing = snapshot.get('missing_vars') or []
+        missing_note = (" — ⚠ unset: " + ", ".join("{{" + m + "}}" for m in missing)) if missing else ""
         self.main.status_bar.showMessage(
-            f"Request #{req_id + 1} done: {status_code} ({elapsed*1000:.0f} ms){test_note}{capture_note}"
+            f"Request #{req_id + 1} done: {status_code} ({elapsed*1000:.0f} ms){test_note}{capture_note}{missing_note}"
         )
 
         ct = (response.headers.get("Content-Type", "") or "").lower()
-        if self._is_binary_content_type(ct) and "image/" not in ct:
+        if self._is_binary_content_type(ct) and "image/" not in ct and not result.get('output_file'):
+            self.main.status_bar.showMessage(
+                f"Request #{req_id + 1} done: {status_code} — binary response ({ct}, {len(response.content):,} bytes). "
+                "Use 'Save Response Body…' to keep it."
+            )
+        elif self._is_binary_content_type(ct) and "image/" not in ct:
+            # The request came from a curl command with --output: offer to save it there.
             choice = QMessageBox.question(
                 self,
                 "Binary Response",
@@ -5841,6 +6229,7 @@ class RequestPanel(QWidget):
                 "output_file": snapshot.get('output_file'),
                 "scripts": snapshot.get('scripts', self._scripts_snapshot()),
                 "graphql_variables": snapshot.get('graphql_variables', ""),
+                "binary_file": snapshot.get('binary_file', ""),
                 "tests": snapshot.get('tests', []),
                 "captures": snapshot.get('captures', []),
             }
@@ -5851,7 +6240,7 @@ class RequestPanel(QWidget):
     # ---------- Save/Load ----------
     def _build_request_dict(self):
         return {
-            "name": f"{self.method_combo.currentText()} {self.url_input.text()}",
+            "name": self._request_name or f"{self.method_combo.currentText()} {self.url_input.text()}",
             "method": self.method_combo.currentText(),
             "url": self.url_input.text(),
             "headers": self.headers_text.toPlainText(),
@@ -5864,29 +6253,74 @@ class RequestPanel(QWidget):
             "output_file": self._pending_output_file,
             "scripts": self._scripts_snapshot(),
             "graphql_variables": self.graphql_variables_text.toPlainText(),
+            "binary_file": self.binary_file_input.text(),
             "tests": self._tests_snapshot(),
             "captures": self._captures_snapshot(),
         }
 
+    def is_blank(self):
+        """True for an untouched tab that can be reused instead of opening another."""
+        return (not self.url_input.text().strip() and not self.body_text.toPlainText().strip()
+                and not self.headers_text.toPlainText().strip() and self._origin_id is None)
+
+    def set_origin(self, collection, index):
+        """Remember which saved request this tab edits, so Save updates it in place."""
+        req = self.main.collections[collection][index]
+        self._origin_id = ensure_request_id(req)
+        self._request_name = req.get("name") or ""
+        save_document("collections", self.main.collections)
+        self.main._update_tab_title(self)
+
+    def origin(self):
+        """(collection, index) of the saved request this tab edits, or None."""
+        return find_request_by_id(self.main.collections, self._origin_id)
+
+    def save(self):
+        """Ctrl+S: update the saved request this tab came from, or ask where to save it."""
+        found = self.origin()
+        if not found:
+            self.save_to_collection()
+            return
+        coll, idx = found
+        req = self._build_request_dict()
+        req["id"] = self._origin_id
+        req["name"] = self.main.collections[coll][idx].get("name") or req["name"]
+        self.main.collections[coll][idx] = req
+        save_document("collections", self.main.collections)
+        self.main.reload_collections()
+        self.main.status_bar.showMessage(f"Saved '{req['name']}' in '{coll}'")
+
     def save_to_collection(self):
-        dlg = SaveToCollectionDialog(sorted(self.main.collections.keys()), self)
+        default_name = self._request_name or self._default_request_name()
+        dlg = SaveToCollectionDialog(sorted(self.main.collections.keys()), self, default_name)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         name = dlg.collection_name()
         if not name:
             return
+        req = self._build_request_dict()
+        req["name"] = dlg.request_name() or default_name
+        req["id"] = new_request_id()
         coll = self.main.collections.setdefault(name, [])
-        coll.append(self._build_request_dict())
+        coll.append(req)
         save_document("collections", self.main.collections)
         self.main.reload_collections()
-        QMessageBox.information(self, "Saved", f"Request saved to collection '{name}'")
+        self._origin_id = req["id"]
+        self._request_name = req["name"]
+        self.main._update_tab_title(self)
+        self.main.status_bar.showMessage(f"Saved '{req['name']}' to '{name}' — Ctrl+S saves later changes")
+
+    def _default_request_name(self):
+        url = self.url_input.text().strip()
+        path = urlparse(url).path if "://" in url else url
+        return f"{self.method_combo.currentText()} {path or url or 'request'}".strip()
 
     def save_request_file(self):
         fname, _ = QFileDialog.getSaveFileName(self, "Save Request", str(Path.home()), "JSON Files (*.json)")
         if not fname:
             return
         try:
-            Path(fname).write_text(json.dumps(self._build_request_dict(), indent=2))
+            Path(fname).write_text(json.dumps(self._build_request_dict(), indent=2), encoding="utf-8")
             QMessageBox.information(self, "Saved", f"Request saved to {fname}")
         except Exception as e:
             QMessageBox.critical(self, "Save Error", str(e))
@@ -5896,7 +6330,7 @@ class RequestPanel(QWidget):
         if not fname:
             return
         try:
-            data = json.loads(Path(fname).read_text())
+            data = json.loads(Path(fname).read_text(encoding="utf-8-sig"))
             self.apply_saved_request(data)
             QMessageBox.information(self, "Loaded", f"Request loaded from {fname}")
         except Exception as e:
@@ -5915,11 +6349,14 @@ class RequestPanel(QWidget):
         self._pending_output_file = req.get("output_file") or None
         self._restore_scripts(req.get("scripts", {}))
         self.graphql_variables_text.setPlainText(req.get("graphql_variables", "") or "")
+        self.binary_file_input.setText(req.get("binary_file", "") or "")
         self._restore_tests(req.get("tests", []))
         self._restore_captures(req.get("captures", []))
         self.main._update_tab_title(self)
 
     def apply_history_entry(self, data):
+        self._origin_id = None
+        self._request_name = ""
         self.method_combo.setCurrentText(data.get("method", "GET"))
         self.url_input.setText(data.get("req_url") or data.get("url", ""))
 
@@ -5949,6 +6386,7 @@ class RequestPanel(QWidget):
         if "scripts" in data:
             self._restore_scripts(data.get("scripts", {}))
         self.graphql_variables_text.setPlainText(data.get("graphql_variables", "") or "")
+        self.binary_file_input.setText(data.get("binary_file", "") or "")
         if "tests" in data:
             self._restore_tests(data.get("tests", []))
         if "captures" in data:
@@ -5958,10 +6396,17 @@ class RequestPanel(QWidget):
         self.main._update_tab_title(self)
 
     def to_dict(self):
-        return self._build_request_dict()
+        data = self._build_request_dict()
+        if self._origin_id:
+            data["origin_id"] = self._origin_id
+        return data
 
     def from_dict(self, data):
         self.apply_saved_request(data)
+        if data.get("origin_id") and find_request_by_id(self.main.collections, data["origin_id"]):
+            self._origin_id = data["origin_id"]
+            self._request_name = data.get("name") or ""
+            self.main._update_tab_title(self)
 
     def format_json_body(self):
         text = self.body_text.toPlainText().strip()
@@ -6026,7 +6471,14 @@ class RequestPanel(QWidget):
         if params:
             url = add_params_to_url(url, params)
 
-        attachments = list(self.file_attachments) if hasattr(self, "file_attachments") else []
+        body_type = self.body_type_combo.currentText()
+        attachments = list(self.file_attachments) if body_type == "Form Data" else []
+        self._snippet_binary = None
+        if body_type == "Binary" and self.binary_file_input.text().strip():
+            self._snippet_binary = apply_env(self.binary_file_input.text().strip(), env)
+            body_raw = ""
+            if not any(k.lower() == "content-type" for k in headers):
+                headers["Content-Type"] = mimetypes.guess_type(self._snippet_binary)[0] or "application/octet-stream"
         return method, url, headers, body_raw, attachments
 
     def _build_snippet(self, fmt: str, ctx) -> str:
@@ -6074,7 +6526,7 @@ class RequestPanel(QWidget):
 
     def generate_curl(self, method, url, headers, body_raw, attachments):
         method = method.upper()
-        parts = ["curl.exe", "-i"]
+        parts = ["curl.exe" if os.name == "nt" else "curl", "-i"]
         proxies = self._resolved_proxies(self.main.get_active_env())
         if proxies:
             parts += ["--proxy", shlex.quote(proxies.get("https") or proxies["http"])]
@@ -6091,9 +6543,10 @@ class RequestPanel(QWidget):
             for att in attachments:
                 mime = att.get("mime") or "application/octet-stream"
                 parts += ["-F", shlex.quote(f"{att['field']}=@{att['path']};type={mime}")]
-        else:
-            if body_raw:
-                parts += ["--data-raw", shlex.quote(body_raw)]
+        elif getattr(self, "_snippet_binary", None):
+            parts += ["--data-binary", shlex.quote("@" + self._snippet_binary)]
+        elif body_raw:
+            parts += ["--data-raw", shlex.quote(body_raw)]
 
         output_file = (self._pending_output_file or "").strip()
         if output_file and output_file != "-":
@@ -6157,7 +6610,10 @@ class RequestPanel(QWidget):
                 except Exception:
                     body_is_json = False
 
-            if body_is_json:
+            if getattr(self, "_snippet_binary", None):
+                lines.append(f"with open({json.dumps(self._snippet_binary)}, 'rb') as f:")
+                lines.append(f"    resp = requests.{method.lower()}({json.dumps(url)}, headers=headers, data=f{proxy_kw})")
+            elif body_is_json:
                 lines.append("json_payload = " + json.dumps(parsed_json, indent=4))
                 lines.append("")
                 lines.append(f"resp = requests.{method.lower()}({json.dumps(url)}, headers=headers, json=json_payload{proxy_kw})")
@@ -6222,7 +6678,11 @@ class RequestPanel(QWidget):
         cmd_parts = [f"Invoke-RestMethod -Uri '{url_ps}' -Method {method}"]
         if hdrs:
             cmd_parts.append("-Headers $headers")
-        if body_raw:
+        if getattr(self, "_snippet_binary", None):
+            cmd_parts.append(f"-InFile '{self._snippet_binary.replace(chr(39), chr(39) * 2)}'")
+            if content_type:
+                cmd_parts.append(f"-ContentType '{content_type.replace(chr(39), chr(39) * 2)}'")
+        elif body_raw:
             if body_is_json:
                 lines.append("$body = @'")
                 lines.append(json.dumps(parsed_json))
@@ -6341,7 +6801,9 @@ class RequestPanel(QWidget):
         ]
         for k, v in hdrs.items():
             L.append(f'            .header("{js(k)}", "{js(v)}")')
-        if body_raw:
+        if getattr(self, "_snippet_binary", None):
+            L.append(f'            .method("{method}", HttpRequest.BodyPublishers.ofFile(java.nio.file.Path.of("{js(self._snippet_binary)}")))')
+        elif body_raw:
             try:
                 body_out = json.dumps(json.loads(body_raw))
             except Exception:
@@ -6425,7 +6887,16 @@ class RequestPanel(QWidget):
             except Exception:
                 body_is_json = False
 
-        if body_is_json:
+        if getattr(self, "_snippet_binary", None):
+            lines.append(f"const data = require('fs').readFileSync({json.dumps(self._snippet_binary)});")
+            lines.append("")
+            lines.append("axios({")
+            lines.append(f"  method: {json.dumps(method_lower)},")
+            lines.append(f"  url: {json.dumps(url)},")
+            lines.append("  headers,")
+            lines.append("  data")
+            lines.append("})")
+        elif body_is_json:
             lines.append("const data = " + json.dumps(parsed_json, indent=2) + ";")
             lines.append("")
             lines.append("axios({")
@@ -6465,71 +6936,24 @@ class RequestPanel(QWidget):
 
     # ---------- Stress test ----------
     def open_stress_test(self):
-        env = self.main.get_active_env()
-
-        url = apply_env(self.url_input.text().strip(), env)
-        if not url:
+        if not self.url_input.text().strip():
             QMessageBox.warning(self, "Invalid URL", "Please enter a URL first.")
             return
-
-        headers = {}
-        for line in self.headers_text.toPlainText().splitlines():
-            line = line.strip()
-            if line and ":" in line:
-                key, value = line.split(":", 1)
-                headers[key.strip()] = apply_env(value.strip(), env)
-
-        body_raw = apply_env(self.body_text.toPlainText().strip(), env)
-        json_body = None
-        data = None
-        body_type = self.body_type_combo.currentText()
-        content_type = headers.get("Content-Type", "").lower()
-
-        if body_type == "GraphQL":
-            try:
-                json_body = build_graphql_payload(body_raw, self.graphql_variables_text.toPlainText(), env)
-            except RequestBuildError as e:
-                QMessageBox.warning(self, e.title, str(e))
-                return
-            headers.setdefault("Content-Type", "application/json")
-        elif body_type == "JSON" or "application/json" in content_type or (body_raw and body_raw.startswith(("{", "["))):
-            if body_raw:
-                try:
-                    json_body = json.loads(body_raw)
-                except Exception:
-                    pass
-        elif body_type == "Form Data":
-            data = {}
-            if body_raw:
-                for pair in body_raw.split("&"):
-                    if "=" in pair:
-                        k, v = pair.split("=", 1)
-                        data[k] = v
-        elif body_raw:
-            data = body_raw.encode("utf-8")
-
-        params = self._resolved_params(env)
-        auth_tuple = self.apply_auth(headers, params, env)
-        advanced = self._advanced_snapshot()
-
-        config = {
-            'method': self.method_combo.currentText(),
-            'url': url,
-            'headers': headers,
-            'json_body': json_body,
-            'data': data,
-            'params': params or None,
-            'auth': auth_tuple,
-            'timeout': None if self.timeout_spin.value() == 0 else self.timeout_spin.value(),
-            'allow_redirects': advanced.get("follow_redirects", True),
-            'verify_ssl': advanced.get("verify_ssl", True),
-            'max_redirects': advanced.get("max_redirects", 30),
-            'retry_total': advanced.get("retry_total", 0),
-            'retry_backoff': advanced.get("retry_backoff", 0.0),
-            'retry_statuses': parse_status_code_list(advanced.get("retry_statuses", "")),
-            'cookie_jar': self.main.cookie_jar if advanced.get("use_cookie_jar", True) else None,
-            'proxies': self._resolved_proxies(env),
-        }
+        timeout = self.timeout_spin.value() or None
+        try:
+            call = prepare_request(self._build_request_dict(), self.main.get_active_env(), timeout,
+                                   oauth_token=self._ensure_oauth_token)
+        except RequestBuildError as e:
+            QMessageBox.warning(self, e.title, str(e))
+            return
+        if call["files"]:
+            # Open file handles can't be shared across concurrent requests.
+            close_call_files(call["files"])
+            QMessageBox.warning(self, "Stress Test",
+                                "File attachments aren't sent during stress tests; only the text fields are.")
+        config = dict(call)
+        config.pop("files", None)
+        config["cookie_jar"] = self.main.cookie_jar if call["use_cookie_jar"] else None
 
         dlg = StressTestDialog(config, self)
         dlg.show()
@@ -7280,6 +7704,10 @@ class SSEWorker(QThread):
                         event = value
                     elif field == "id":
                         event_id = value
+                if data_lines and not self._stopping:
+                    # The stream ended without the blank line that closes the last event.
+                    label = (event or "message") + (f" #{event_id}" if event_id else "")
+                    self.message.emit("in", f"[{label}] " + "\n".join(data_lines))
         except Exception as e:
             if not self._stopping:
                 reason = f"Connection lost: {e}"
@@ -7444,13 +7872,62 @@ class RealtimeConsoleDialog(QDialog):
         super().closeEvent(event)
 
 
+KEYBOARD_SHORTCUTS = [
+    ("Ctrl+Enter / F5", "Send the request"),
+    ("Ctrl+S", "Save (updates the collection request this tab came from)"),
+    ("Ctrl+Shift+S", "Save to a collection as a new request"),
+    ("Ctrl+T / Ctrl+W", "New tab / close tab"),
+    ("Ctrl+D", "Duplicate tab"),
+    ("Ctrl+Tab / Ctrl+Shift+Tab", "Next / previous tab"),
+    ("Ctrl+L", "Focus the URL bar"),
+    ("Ctrl+F", "Filter the response (text or $.json.path)"),
+    ("Ctrl+P", "Search collections"),
+    ("Ctrl+Shift+C", "Copy the request as cURL"),
+    ("Ctrl+E", "Manage environments"),
+    ("Ctrl+R", "Run the selected collection"),
+    ("Ctrl+O", "Import a collection or API spec"),
+    ("Ctrl+= / Ctrl+- / Ctrl+0", "Larger / smaller / default text"),
+    ("Delete", "Delete the selected history entry"),
+    ("F1", "This list"),
+]
+
+_ORIGINAL_STYLE = {}
+
+
+def apply_app_palette(app, dark):
+    """Switch the whole application between the platform look and a dark Fusion theme."""
+    if "style" not in _ORIGINAL_STYLE:
+        _ORIGINAL_STYLE["style"] = app.style().name()
+        _ORIGINAL_STYLE["palette"] = app.palette()
+    if not dark:
+        app.setStyle(_ORIGINAL_STYLE["style"])
+        app.setPalette(_ORIGINAL_STYLE["palette"])
+        return
+    from PyQt6.QtGui import QPalette
+    app.setStyle("Fusion")
+    p = QPalette()
+    role, group = QPalette.ColorRole, QPalette.ColorGroup
+    colors = {
+        role.Window: "#2b2b2b", role.WindowText: "#e6e6e6", role.Base: "#1e1e1e",
+        role.AlternateBase: "#262626", role.ToolTipBase: "#3a3a3a", role.ToolTipText: "#e6e6e6",
+        role.Text: "#e6e6e6", role.Button: "#353535", role.ButtonText: "#e6e6e6",
+        role.BrightText: "#ff6b6b", role.Link: "#5aa9ff", role.Highlight: "#2f6fbf",
+        role.HighlightedText: "#ffffff", role.PlaceholderText: "#8a8a8a",
+    }
+    for r, c in colors.items():
+        p.setColor(r, QColor(c))
+    for r in (role.Text, role.WindowText, role.ButtonText):
+        p.setColor(group.Disabled, r, QColor("#7a7a7a"))
+    app.setPalette(p)
+
+
 # ---------------------------
 # Main window
 # ---------------------------
 class CurlPyProMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CurlPyPro - With Snippet Generator")
+        self.setWindowTitle("CurlPyPro")
         self.setWindowIcon(app_icon())
         self.resize(1400, 900)
 
@@ -7477,6 +7954,7 @@ class CurlPyProMainWindow(QMainWindow):
 
         self.init_ui()
         self.init_status_bar()
+        self.init_menu_bar()
         self.apply_theme()
 
     # ---------- UI ----------
@@ -7496,8 +7974,124 @@ class CurlPyProMainWindow(QMainWindow):
 
         main_splitter.setSizes([360, 1040])
 
-        QShortcut(QKeySequence("Ctrl+T"), self, activated=lambda: self.new_tab())
-        QShortcut(QKeySequence("Ctrl+W"), self, activated=lambda: self.close_tab(self.tabs.currentIndex()))
+        def on_panel(method_name):
+            def run():
+                panel = self.current_panel()
+                if panel is not None:
+                    getattr(panel, method_name)()
+            return run
+
+        shortcuts = [
+            ("Ctrl+W", lambda: self.close_tab(self.tabs.currentIndex())),
+            ("Ctrl+Return", on_panel("send_request")),
+            ("Ctrl+Enter", on_panel("send_request")),
+            ("F5", on_panel("send_request")),
+            ("Ctrl+L", on_panel("focus_url")),
+            ("Ctrl+D", lambda: self._duplicate_tab(self.tabs.currentIndex())),
+            ("Ctrl+Tab", lambda: self._cycle_tab(1)),
+            ("Ctrl+Shift+Tab", lambda: self._cycle_tab(-1)),
+            ("Ctrl+PgDown", lambda: self._cycle_tab(1)),
+            ("Ctrl+PgUp", lambda: self._cycle_tab(-1)),
+            ("Ctrl+F", on_panel("focus_response_filter")),
+            ("Ctrl+P", lambda: self.collection_filter.setFocus()),
+        ]
+        for keys, slot in shortcuts:
+            shortcut = QShortcut(QKeySequence(keys), self)
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut.activated.connect(slot)
+
+    def _cycle_tab(self, step):
+        count = self.tabs.count()
+        if count:
+            self.tabs.setCurrentIndex((self.tabs.currentIndex() + step) % count)
+
+    def init_menu_bar(self):
+        def on_panel(method_name):
+            return lambda: self.current_panel() and getattr(self.current_panel(), method_name)()
+
+        bar = self.menuBar()
+        file_menu = bar.addMenu("&File")
+        file_menu.addAction("New Request Tab", lambda: self.new_tab()).setShortcut(QKeySequence("Ctrl+T"))
+        file_menu.addAction("Save", on_panel("save")).setShortcut(QKeySequence("Ctrl+S"))
+        file_menu.addAction("Save to Collection…", on_panel("save_to_collection")).setShortcut(
+            QKeySequence("Ctrl+Shift+S"))
+        file_menu.addSeparator()
+        file_menu.addAction("Import Collection / Spec…", self.import_collection).setShortcut(QKeySequence("Ctrl+O"))
+        file_menu.addAction("Export Collection (CurlPyPro)…", self.export_collection)
+        file_menu.addAction("Export Collection (Postman v2.1)…", self.export_collection_postman)
+        file_menu.addSeparator()
+        file_menu.addAction("Quit", self.close).setShortcut(QKeySequence("Ctrl+Q"))
+
+        request_menu = bar.addMenu("&Request")
+        request_menu.addAction("Send  (Ctrl+Enter / F5)", on_panel("send_request"))
+        request_menu.addAction("Focus URL  (Ctrl+L)", on_panel("focus_url"))
+        request_menu.addAction("Duplicate Tab  (Ctrl+D)", lambda: self._duplicate_tab(self.tabs.currentIndex()))
+        request_menu.addSeparator()
+        request_menu.addAction("Copy as cURL", on_panel("copy_as_curl")).setShortcut(QKeySequence("Ctrl+Shift+C"))
+        request_menu.addAction("Generate Code…", on_panel("generate_all_and_show"))
+        request_menu.addAction("Stress Test…", on_panel("open_stress_test"))
+        request_menu.addAction("WebSocket / SSE Console…", on_panel("open_realtime_console"))
+
+        tools_menu = bar.addMenu("&Tools")
+        tools_menu.addAction("Manage Environments…", self.manage_environments).setShortcut(QKeySequence("Ctrl+E"))
+        tools_menu.addAction("Cookies…", self.manage_cookies)
+        tools_menu.addAction("Run Collection…", self.run_selected_collection).setShortcut(QKeySequence("Ctrl+R"))
+        tools_menu.addSeparator()
+        tools_menu.addAction("Clear History…", self.clear_history)
+
+        view_menu = bar.addMenu("&View")
+        self.dark_action = view_menu.addAction("Dark Theme")
+        self.dark_action.setCheckable(True)
+        self.dark_action.setChecked(self.settings.get("theme") == "dark")
+        self.dark_action.toggled.connect(self.set_dark_theme)
+        self.format_action = view_menu.addAction("Auto-format JSON Responses")
+        self.format_action.setCheckable(True)
+        self.format_action.setChecked(self.settings.get("auto_format_json", True))
+        self.format_action.toggled.connect(lambda on: self.settings.__setitem__("auto_format_json", on))
+        view_menu.addSeparator()
+        view_menu.addAction("Larger Text", lambda: self.change_font_size(1)).setShortcut(QKeySequence("Ctrl+="))
+        view_menu.addAction("Smaller Text", lambda: self.change_font_size(-1)).setShortcut(QKeySequence("Ctrl+-"))
+        view_menu.addAction("Reset Text Size", lambda: self.change_font_size(0)).setShortcut(QKeySequence("Ctrl+0"))
+
+        help_menu = bar.addMenu("&Help")
+        help_menu.addAction("Keyboard Shortcuts", self.show_shortcuts).setShortcut(QKeySequence("F1"))
+        help_menu.addAction("Variables Cheat Sheet", self.show_variables_help)
+        help_menu.addAction("About CurlPyPro", self.show_about)
+
+    def set_dark_theme(self, dark):
+        self.settings["theme"] = "dark" if dark else "light"
+        save_document("settings", self.settings)
+        self.apply_theme()
+
+    def change_font_size(self, step):
+        size = self.settings.get("font_size", 10)
+        size = 10 if step == 0 else max(7, min(24, size + step))
+        self.settings["font_size"] = size
+        save_document("settings", self.settings)
+        self.apply_theme()
+        self.status_bar.showMessage(f"Text size {size} pt")
+
+    def show_shortcuts(self):
+        rows = "".join(f"<tr><td><b>{k}</b></td><td>&nbsp;&nbsp;{v}</td></tr>" for k, v in KEYBOARD_SHORTCUTS)
+        QMessageBox.information(self, "Keyboard Shortcuts", f"<table>{rows}</table>")
+
+    def show_variables_help(self):
+        dynamic = ", ".join(f"<code>{{{{{name}}}}}</code>" for name in DYNAMIC_VARIABLES)
+        QMessageBox.information(self, "Variables", (
+            "<p>Write <code>{{NAME}}</code> in the URL, params, headers, body, auth or tests to use a "
+            "variable from the active environment. Names may contain letters, digits, <code>_ . -</code>.</p>"
+            f"<p><b>Dynamic variables</b> get a fresh value on every send: {dynamic}.</p>"
+            "<p>Set variables from responses on a request's <b>Capture</b> tab, or with a post-response script. "
+            "Unknown variables are listed in the status bar when you send.</p>"
+        ))
+
+    def show_about(self):
+        QMessageBox.information(self, "About CurlPyPro", (
+            f"<h3>CurlPyPro {__version__}</h3>"
+            "<p>A fast, offline-first desktop API client.</p>"
+            f"<p>Data folder: <code>{_html.escape(str(DATA_DIR))}</code></p>"
+            "<p><a href='https://github.com/lewisMachilika/CurlPyPro'>github.com/lewisMachilika/CurlPyPro</a></p>"
+        ))
 
     def create_left_panel(self):
         left_widget = QWidget()
@@ -7543,6 +8137,13 @@ class CurlPyProMainWindow(QMainWindow):
         collections_toolbar.addWidget(btn_coll_collapse)
 
         collections_layout.addLayout(collections_toolbar)
+
+        self.collection_filter = QLineEdit()
+        self.collection_filter.setPlaceholderText("Search requests…  (Ctrl+P)")
+        self.collection_filter.setClearButtonEnabled(True)
+        self.collection_filter.textChanged.connect(self._filter_collections)
+        self.collection_filter.returnPressed.connect(self._open_first_visible_request)
+        collections_layout.addWidget(self.collection_filter)
 
         self.collections_tree = QTreeWidget()
         self.collections_tree.setHeaderLabel("Collections")
@@ -7688,9 +8289,11 @@ class CurlPyProMainWindow(QMainWindow):
     def _tab_title_for(self, panel):
         method = panel.method_combo.currentText() if hasattr(panel, "method_combo") else "GET"
         url = panel.url_input.text().strip() if hasattr(panel, "url_input") else ""
-        if not url:
+        label = getattr(panel, "_request_name", "") if getattr(panel, "_origin_id", None) else ""
+        label = label or url
+        if not label:
             return "New Request"
-        short = url if len(url) <= 28 else url[:27] + "…"
+        short = label if len(label) <= 28 else label[:27] + "…"
         return f"{method} {short}"
 
     def _update_tab_title(self, panel):
@@ -7712,7 +8315,9 @@ class CurlPyProMainWindow(QMainWindow):
         panel = self.tabs.widget(index)
         if panel is None:
             return
-        self.new_tab(from_data=panel.to_dict())
+        data = panel.to_dict()
+        data.pop("origin_id", None)  # the copy is a new, unsaved request
+        self.new_tab(from_data=data)
 
     def _close_other_tabs(self, index):
         for i in reversed(range(self.tabs.count())):
@@ -7765,13 +8370,16 @@ class CurlPyProMainWindow(QMainWindow):
         self.status_bar.showMessage("Ready")
 
     def apply_theme(self):
-        if self.settings.get("theme") == "dark":
-            self.setStyleSheet("QMainWindow { background-color: #2b2b2b; color: #ffffff; }")
-        else:
-            self.setStyleSheet("""
-                QGroupBox { border: 2px solid #ddd; border-radius: 5px; margin-top: 10px; padding-top: 10px; font-weight: bold; }
-                QPushButton#send_btn { background-color: #28a745; min-width: 100px; }
-            """)
+        app = QApplication.instance()
+        dark = self.settings.get("theme") == "dark"
+        if app is not None:
+            apply_app_palette(app, dark)
+        border = "#555" if dark else "#ddd"
+        self.setStyleSheet(f"""
+            QGroupBox {{ border: 2px solid {border}; border-radius: 5px; margin-top: 10px; padding-top: 10px; font-weight: bold; }}
+            QPushButton#send_btn {{ background-color: #28a745; color: white; font-weight: bold; min-width: 100px; }}
+            QPushButton#send_btn:disabled {{ background-color: #7fbf8e; }}
+        """)
         font = self.font()
         font.setPointSize(self.settings.get("font_size", 10))
         self.setFont(font)
@@ -7791,6 +8399,35 @@ class CurlPyProMainWindow(QMainWindow):
                 coll_item.addChild(req_item)
             self.collections_tree.addTopLevelItem(coll_item)
         self.collections_tree.expandAll()
+        if hasattr(self, "collection_filter") and self.collection_filter.text().strip():
+            self._filter_collections(self.collection_filter.text())
+
+    def _filter_collections(self, text):
+        """Hide requests whose name, method and URL don't contain every typed word."""
+        words = text.lower().split()
+        for i in range(self.collections_tree.topLevelItemCount()):
+            coll_item = self.collections_tree.topLevelItem(i)
+            coll_name = (coll_item.data(0, Qt.ItemDataRole.UserRole) or {}).get("name", "").lower()
+            visible = 0
+            for j in range(coll_item.childCount()):
+                child = coll_item.child(j)
+                hay = f"{coll_name} {child.text(0)} {child.toolTip(0)}".lower()
+                match = all(w in hay for w in words)
+                child.setHidden(not match)
+                visible += match
+            coll_item.setHidden(bool(words) and visible == 0)
+            if words:
+                coll_item.setExpanded(True)
+
+    def _open_first_visible_request(self):
+        for i in range(self.collections_tree.topLevelItemCount()):
+            coll_item = self.collections_tree.topLevelItem(i)
+            for j in range(coll_item.childCount()):
+                child = coll_item.child(j)
+                if not child.isHidden() and not coll_item.isHidden():
+                    meta = child.data(0, Qt.ItemDataRole.UserRole)
+                    self._open_collection_request(meta["collection"], meta["index"], reuse_blank=True)
+                    return
 
     def reload_history(self):
         if not hasattr(self, "history_tree"):
@@ -7901,12 +8538,7 @@ class CurlPyProMainWindow(QMainWindow):
             return
         coll = data.get("collection")
         idx = data.get("index")
-        try:
-            req = self.collections[coll][idx]
-            self.current_panel().apply_saved_request(req)
-            QMessageBox.information(self, "Loaded", f"Loaded request from collection '{coll}'")
-        except Exception as e:
-            QMessageBox.critical(self, "Load Error", str(e))
+        self._open_collection_request(coll, idx, reuse_blank=True)
 
     def load_history_item(self, item, _col=0):
         data = item.data(0, Qt.ItemDataRole.UserRole)
@@ -8103,20 +8735,33 @@ class CurlPyProMainWindow(QMainWindow):
             name = meta.get("name")
             menu.addAction("Run Collection…", lambda: self.run_selected_collection(name))
             menu.addAction("Rename…", lambda: self._rename_collection(name))
+            menu.addAction("Export as Postman v2.1…", lambda: self.export_collection_postman(name))
             menu.addSeparator()
             menu.addAction("Delete Collection", lambda: self._delete_collection(name))
         else:
             coll, idx = meta.get("collection"), meta.get("index")
             menu.addAction("Open in New Tab", lambda: self._open_collection_request(coll, idx))
+            menu.addAction("Rename…", lambda: self._rename_collection_request(coll, idx))
+            menu.addAction("Duplicate", lambda: self._duplicate_collection_request(coll, idx))
+            menu.addAction("Move Up", lambda: self._move_collection_request(coll, idx, -1))
+            menu.addAction("Move Down", lambda: self._move_collection_request(coll, idx, 1))
             menu.addSeparator()
             menu.addAction("Delete Request", lambda: self._delete_collection_request(coll, idx))
         menu.exec(self.collections_tree.viewport().mapToGlobal(pos))
 
-    def _open_collection_request(self, coll, idx):
+    def _open_collection_request(self, coll, idx, reuse_blank=False):
+        """Open a saved request in a tab: the current one if it's empty, else a new one."""
         try:
-            self.new_tab(from_data=self.collections[coll][idx])
-        except (KeyError, IndexError):
-            pass
+            req = self.collections[coll][idx]
+        except (KeyError, IndexError, TypeError):
+            return
+        panel = self.current_panel()
+        if reuse_blank and panel is not None and panel.is_blank():
+            panel.apply_saved_request(req)
+        else:
+            panel = self.new_tab(from_data=req)
+        panel.set_origin(coll, idx)
+        self.status_bar.showMessage(f"Opened '{req.get('name', 'request')}' from '{coll}' — Ctrl+S saves changes back")
 
     def _rename_collection(self, name):
         new_name, ok = QInputDialog.getText(self, "Rename Collection", "New name:", text=name)
@@ -8138,6 +8783,44 @@ class CurlPyProMainWindow(QMainWindow):
             self.collections.pop(name, None)
             save_document("collections", self.collections)
             self.reload_collections()
+
+    def _rename_collection_request(self, coll, idx):
+        try:
+            req = self.collections[coll][idx]
+        except (KeyError, IndexError):
+            return
+        new_name, ok = QInputDialog.getText(self, "Rename Request", "Request name:", text=req.get("name", ""))
+        new_name = (new_name or "").strip()
+        if not ok or not new_name:
+            return
+        req["name"] = new_name
+        save_document("collections", self.collections)
+        self.reload_collections()
+        for i in range(self.tabs.count()):
+            panel = self.tabs.widget(i)
+            if panel._origin_id and panel._origin_id == req.get("id"):
+                panel._request_name = new_name
+                self._update_tab_title(panel)
+
+    def _duplicate_collection_request(self, coll, idx):
+        try:
+            req = copy.deepcopy(self.collections[coll][idx])
+        except (KeyError, IndexError):
+            return
+        req["id"] = new_request_id()
+        req["name"] = f"{req.get('name') or 'Request'} (copy)"
+        self.collections[coll].insert(idx + 1, req)
+        save_document("collections", self.collections)
+        self.reload_collections()
+
+    def _move_collection_request(self, coll, idx, step):
+        items = self.collections.get(coll) or []
+        target = idx + step
+        if not (0 <= idx < len(items) and 0 <= target < len(items)):
+            return
+        items[idx], items[target] = items[target], items[idx]
+        save_document("collections", self.collections)
+        self.reload_collections()
 
     def _delete_collection_request(self, coll, idx):
         try:
@@ -8164,10 +8847,35 @@ class CurlPyProMainWindow(QMainWindow):
         if not fname:
             return
         try:
-            Path(fname).write_text(json.dumps(data_to_export, indent=2))
+            Path(fname).write_text(json.dumps(data_to_export, indent=2), encoding="utf-8")
             QMessageBox.information(self, "Exported", f"Exported collections to {fname}")
         except Exception as e:
             QMessageBox.critical(self, "Export Error", str(e))
+
+    def export_collection_postman(self, name=None):
+        name = name or self._selected_collection_name()
+        if not name and len(self.collections) == 1:
+            name = next(iter(self.collections))
+        if not name or name not in self.collections:
+            QMessageBox.information(self, "Export", "Select a collection to export.")
+            return
+        data, warnings = export_postman_collection(name, self.collections[name])
+        safe = re.sub(r'[\\/:*?"<>|]+', "_", name)
+        fname, _ = QFileDialog.getSaveFileName(
+            self, "Export as Postman Collection", str(Path.home() / f"{safe}.postman_collection.json"),
+            "Postman collection (*.json)")
+        if not fname:
+            return
+        try:
+            Path(fname).write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", str(e))
+            return
+        note = ""
+        if warnings:
+            shown = warnings[:8]
+            note = "\n\nNotes:\n• " + "\n• ".join(shown) + (f"\n…and {len(warnings) - 8} more" if len(warnings) > 8 else "")
+        QMessageBox.information(self, "Exported", f"Exported '{name}' to {fname}{note}")
 
     def clear_history(self):
         reply = QMessageBox.question(self, "Clear History", "Clear all request history?")
@@ -8422,6 +9130,11 @@ def cli_main(argv):
 def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("run", "--version", "-h", "--help"):
         sys.exit(cli_main(sys.argv[1:]))
+
+    if sys.platform.startswith("linux") and hasattr(os, "geteuid") and os.geteuid() == 0:
+        # Chromium (behind the HTML preview) refuses to start its sandbox as
+        # root and aborts the whole app, e.g. in Docker. Run it unsandboxed.
+        os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 
     if sys.platform == "win32":
         # Gives the taskbar/window a stable identity instead of Python's icon.

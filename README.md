@@ -35,7 +35,8 @@ keeps everything in one local SQLite file you control.
 
 - Any HTTP method, multiple request tabs
 - Query-parameter table with enable/disable per row (auto-extracted from the URL)
-- Headers, raw/JSON body, and `multipart/form-data` file and image uploads
+- Headers, raw/JSON body, `multipart/form-data` file and image uploads, and
+  **binary** bodies sent straight from a file
 - **GraphQL** body mode with a variables editor and a schema browser that
   builds queries from introspection
 - Paste a `curl` command into the URL bar to import it
@@ -47,7 +48,11 @@ keeps everything in one local SQLite file you control.
 
 ### Environments
 
-- `{{VAR}}` substitution in URL, params, headers, auth and body
+- `{{VAR}}` substitution in URL, params, headers, auth and body; names may use
+  dots and dashes like Postman's (`{{api.key}}`, `{{base-url}}`)
+- **Dynamic variables** with a fresh value on every send: `{{$guid}}`,
+  `{{$timestamp}}`, `{{$isoTimestamp}}`, `{{$randomInt}}`, `{{$randomEmail}}` and more
+- Variables the active environment doesn't define are flagged in the status bar when you send
 - Switch between environments (dev / staging / prod) in one click
 - **Request chaining:** capture a value from a response (JSON path, header,
   status or regex) into a variable that later requests use, e.g. log in once
@@ -58,7 +63,8 @@ keeps everything in one local SQLite file you control.
 
 ### Inspect responses
 
-- Status, timing, size, and headers
+- Status (color-coded), timing, size, and headers
+- **Filter the response** by text or by JSON path (`$.data.items[0]`), and copy it in one click
 - Pretty-printed JSON, HTML and XML; image and HTML previews
 - **Diff** each response against the previous one (or any history entry),
   ignoring JSON key order
@@ -83,10 +89,17 @@ keeps everything in one local SQLite file you control.
 ### Import
 
 - **Postman** collections (v2.0 / v2.1) and environments, including folders,
-  auth inheritance, path variables and simple status tests
+  auth inheritance, path variables, binary bodies and common tests (status,
+  response time, header present, body contains)
 - **OpenAPI 3** and **Swagger 2** specs in JSON or YAML: every operation becomes
   a request with example bodies, query params and auth, plus a `{{baseUrl}}`
   environment
+
+### Export
+
+- CurlPyPro's own JSON format, or **Postman v2.1** (**File → Export Collection
+  (Postman v2.1)** or right-click a collection). Folders, auth, bodies and the
+  assertions Postman can express come along.
 
 ### Realtime
 
@@ -95,10 +108,13 @@ keeps everything in one local SQLite file you control.
 
 ### Productivity
 
-- History and saved collections
+- History and saved collections; search requests across collections (`Ctrl+P`)
+- Open a saved request, edit it and press `Ctrl+S` to update it in place;
+  rename, duplicate and reorder requests from the right-click menu
+- Menu bar with every action and its shortcut; `F1` lists all shortcuts
 - Code snippets for curl, Python `requests`, PowerShell, Java, and axios
 - Stress testing with concurrency, status breakdowns and latency summaries
-- Light and dark themes
+- Light and dark themes (**View → Dark Theme**) and adjustable text size
 
 ## Install
 
@@ -193,13 +209,26 @@ then:
 
 ## Keyboard shortcuts
 
-| Shortcut       | Action                |
-|----------------|-----------------------|
-| `Ctrl+T`       | New request tab       |
-| `Ctrl+W`       | Close current tab     |
-| `Delete`       | Delete selected history entry |
-| `Ctrl+Shift+C` | Copy current snippet (in the snippet dialog) |
-| `Ctrl+Enter`   | Send message (in the WebSocket console) |
+| Shortcut                    | Action                                   |
+|-----------------------------|------------------------------------------|
+| `Ctrl+Enter` / `F5`         | Send the request                         |
+| `Ctrl+S`                    | Save (updates the collection request the tab came from) |
+| `Ctrl+Shift+S`              | Save to a collection as a new request    |
+| `Ctrl+T` / `Ctrl+W`         | New tab / close tab                      |
+| `Ctrl+D`                    | Duplicate tab                            |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab                    |
+| `Ctrl+L`                    | Focus the URL bar                        |
+| `Ctrl+F`                    | Filter the response (text or `$.json.path`) |
+| `Ctrl+P`                    | Search collections                       |
+| `Ctrl+Shift+C`              | Copy the request as cURL                 |
+| `Ctrl+E`                    | Manage environments                      |
+| `Ctrl+R`                    | Run the selected collection              |
+| `Ctrl+O`                    | Import a collection or API spec          |
+| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Larger / smaller / default text       |
+| `Delete`                    | Delete selected history entry            |
+| `F1`                        | Show all shortcuts                       |
+
+In the WebSocket console, `Ctrl+Enter` sends the message.
 
 ## Where is my data?
 
@@ -211,6 +240,18 @@ Environment variables marked **Secret** are the exception: their values live in
 your OS keychain under the service name `CurlPyPro`, so they don't travel with
 the database file. Everything else, including auth fields typed directly into a
 request and stored history, is saved **unencrypted**. See [SECURITY.md](SECURITY.md).
+
+## Run the tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest          # core, importers, CLI runner and the GUI (headless)
+ruff check curlpypro.py tests
+```
+
+The GUI tests drive the real window with `pytest-qt` against a local test
+server, so they need no network access. On a Linux machine without a display,
+run them with `QT_QPA_PLATFORM=offscreen`.
 
 ## Build a standalone app
 
@@ -255,8 +296,8 @@ Ideas being considered. Upvote or discuss them in
 - [x] Chain requests by capturing response values into variables
 - [x] Secrets in the OS keychain
 - [x] Command-line runner for CI pipelines
-- [ ] Export collections back to Postman format
-- [ ] Automated test suite and linting in CI
+- [x] Export collections back to Postman format
+- [x] Automated test suite and linting in CI
 
 ## Contributing
 

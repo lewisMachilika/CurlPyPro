@@ -3,3 +3,7 @@
 -r requirements.txt
 pyinstaller>=6.6,<7
 pillow>=10,<13  # scripts/make_wizard_images.py
+# Tests and lint:  python -m pytest   /   ruff check curlpypro.py tests
+pytest>=8
+pytest-qt>=4.4
+ruff>=0.5
